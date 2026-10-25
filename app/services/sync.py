@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import logging
+import sqlite3
+from datetime import datetime
+
+from app.adapters import get_adapter
+from app.adapters.base import SyncPayload
+from app.db import log_op
+from app.errors import AdapterNotReady, AppError
+from app.timeutil import iso, now_local
+
+logger = logging.getLogger(__name__)
+
+
+def sync_account(conn: sqlite3.Connection, *, mode: str, now: datetime | None = None) -> dict:
+    now = now or now_local()
+    started = iso(now)
+    cur = conn.execute(
+        "INSERT INTO sync_runs(shop_id, mode, status, message, started_at) VALUES(?, ?, ?, ?, ?)",
+        (None, mode, "running", "开始同步", started),
+    )
+    conn.commit()
+    run_id = int(cur.lastrowid)
+    try:
+        payload = get_adapter(mode).fetch(today=now.date(), now=now)
+        counts = _persist(conn, payload, synced_at=iso(now_local()))
+        message = (
+            f"已同步 {payload.shop.name}：计划 {counts['campaigns']}，"
+            f"测款 {counts['goods']}，测图 {counts['images']}，"
+            f"覆盖 {counts['days']} 天"
+        )
+        _finish(conn, run_id, payload.shop.shop_id, "success", message)
+        log_op(conn, "同步", message)
+        return {
+            "ok": True,
+            "shop_id": payload.shop.shop_id,
+            "shop_name": payload.shop.name,
+            "message": message,
+            **counts,
+        }
+    except AdapterNotReady as exc:
+        _finish(conn, run_id, None, "failed", str(exc))
+        raise
+    except Exception as exc:
+        logger.exception("sync failed")
+        _finish(conn, run_id, None, "failed", "同步失败")
+        if isinstance(exc, AppError):
+            raise
+        raise AppError("同步失败", status=500, code="sync_failed") from exc
+
+
+def _finish(conn, run_id: int, shop_id: str | None, status: str, message: str) -> None:
+    conn.execute(
+        "UPDATE sync_runs SET shop_id = ?, status = ?, message = ?, finished_at = ? WHERE id = ?",
+        (shop_id, status, message, iso(now_local()), run_id),
+    )
+    conn.commit()
+
+
+def _persist(conn: sqlite3.Connection, payload: SyncPayload, synced_at: str) -> dict:
+    shop = payload.shop
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO shops(shop_id, mall_id, name, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(shop_id) DO UPDATE SET
+              mall_id = excluded.mall_id,
+              name = excluded.name,
+              updated_at = excluded.updated_at
+            """,
+            (shop.shop_id, shop.mall_id, shop.name, synced_at, synced_at),
+        )
+        for camp in payload.campaigns:
+            conn.execute(
+                """
+                INSERT INTO campaigns(
+                  campaign_id, shop_id, name, scene, status, daily_budget_fen, bid_fen, pace, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id) DO UPDATE SET
+                  name = excluded.name,
+                  scene = excluded.scene,
+                  status = excluded.status,
+                  daily_budget_fen = excluded.daily_budget_fen,
+                  bid_fen = excluded.bid_fen,
+                  pace = excluded.pace,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    camp.campaign_id,
+                    shop.shop_id,
+                    camp.name,
+                    camp.scene,
+                    camp.status,
+                    camp.daily_budget_fen,
+                    camp.bid_fen,
+                    camp.pace,
+                    synced_at,
+                ),
+            )
+            for day in payload.campaign_days.get(camp.campaign_id, []):
+                _upsert_daily(
+                    conn,
+                    "campaign_daily",
+                    "campaign_id",
+                    camp.campaign_id,
+                    shop.shop_id,
+                    day,
+                    synced_at,
+                    with_cart=True,
+                )
+        for goods in payload.goods:
+            conn.execute(
+                """
+                INSERT INTO goods(
+                  goods_id, shop_id, campaign_id, name, category, price_fen, stage, daily_budget_fen, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(goods_id) DO UPDATE SET
+                  campaign_id = excluded.campaign_id,
+                  name = excluded.name,
+                  category = excluded.category,
+                  price_fen = excluded.price_fen,
+                  stage = excluded.stage,
+                  daily_budget_fen = excluded.daily_budget_fen,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    goods.goods_id,
+                    shop.shop_id,
+                    goods.campaign_id,
+                    goods.name,
+                    goods.category,
+                    goods.price_fen,
+                    goods.stage,
+                    goods.daily_budget_fen,
+                    synced_at,
+                ),
+            )
+            for day in payload.goods_days.get(goods.goods_id, []):
+                _upsert_daily(
+                    conn,
+                    "goods_daily",
+                    "goods_id",
+                    goods.goods_id,
+                    shop.shop_id,
+                    day,
+                    synced_at,
+                    with_cart=True,
+                )
+        for image in payload.images:
+            conn.execute(
+                """
+                INSERT INTO image_tests(image_id, shop_id, goods_id, label, tone, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                  goods_id = excluded.goods_id,
+                  label = excluded.label,
+                  tone = excluded.tone,
+                  updated_at = excluded.updated_at
+                """,
+                (image.image_id, shop.shop_id, image.goods_id, image.label, image.tone, synced_at),
+            )
+            for day in payload.image_days.get(image.image_id, []):
+                _upsert_daily(
+                    conn,
+                    "image_daily",
+                    "image_id",
+                    image.image_id,
+                    shop.shop_id,
+                    day,
+                    synced_at,
+                    with_cart=False,
+                )
+    day_count = 0
+    if payload.goods_days:
+        day_count = max(len(series) for series in payload.goods_days.values())
+    return {
+        "campaigns": len(payload.campaigns),
+        "goods": len(payload.goods),
+        "images": len(payload.images),
+        "days": day_count,
+    }
+
+
+def _upsert_daily(conn, table, id_col, entity_id, shop_id, day, synced_at, *, with_cart: bool) -> None:
+    cart_col = ", add_to_cart" if with_cart else ""
+    cart_val = ", ?" if with_cart else ""
+    params = [
+        entity_id,
+        shop_id,
+        day.stat_date,
+        day.impressions,
+        day.clicks,
+        day.spend_fen,
+        day.orders,
+        day.gmv_fen,
+    ]
+    if with_cart:
+        params.append(day.add_to_cart)
+    params.append(synced_at)
+    assignments = """
+      impressions = excluded.impressions,
+      clicks = excluded.clicks,
+      spend_fen = excluded.spend_fen,
+      orders = excluded.orders,
+      gmv_fen = excluded.gmv_fen,
+    """
+    if with_cart:
+        assignments += "add_to_cart = excluded.add_to_cart,\n"
+    assignments += "synced_at = excluded.synced_at"
+    conn.execute(
+        f"""
+        INSERT INTO {table}(
+          {id_col}, shop_id, stat_date, impressions, clicks, spend_fen, orders, gmv_fen{cart_col}, synced_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?{cart_val}, ?)
+        ON CONFLICT({id_col}, stat_date) DO UPDATE SET
+          {assignments}
+        """,
+        params,
+    )
