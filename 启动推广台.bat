@@ -18,5 +18,6 @@ if errorlevel 1 (
   echo   py -3 -m venv .venv
   echo   .venv\Scripts\activate
   echo   pip install -r requirements-windows.txt
+  echo   python -m playwright install chromium
   pause
 )

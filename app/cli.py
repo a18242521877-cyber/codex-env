@@ -63,6 +63,7 @@ def serve(db_path: Path, port: int, mode: str) -> int:
     thread.start()
     print(f"{APP_NAME}已启动：{url}")
     print(f"数据文件：{db_path}")
+    _warn_if_live_browser_missing(db_path)
     stopped = False
 
     def stop() -> None:
@@ -120,6 +121,25 @@ def _open_webview(url: str, stop) -> None:
     except Exception:
         logger.info("当前 pywebview 不支持关闭事件，窗口关掉后进程会跟着退出")
     webview.start()
+
+
+def _warn_if_live_browser_missing(db_path: Path) -> None:
+    conn = connect(db_path)
+    try:
+        init_db(conn)
+        from app.settings import load_settings
+
+        if load_settings(conn).data_mode != "live":
+            return
+    finally:
+        conn.close()
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError:
+        print("当前是真实店铺，但还没有安装浏览器组件。")
+        print("pip install playwright")
+        print("python -m playwright install chromium")
+        print("Windows 已安装 Edge 时，装好 playwright 后会优先使用 Edge。")
 
 
 def _configure_stdio() -> None:

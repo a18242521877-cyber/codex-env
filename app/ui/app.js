@@ -197,12 +197,26 @@ async function startQr() {
   if (!data.ready) {
     panel.innerHTML = `
       ${switcher}
-      <h2>真实店铺还不能在这里登录</h2>
-      <p class="small">${esc(data.message)}</p>
-      <p><a href="${esc(data.official_login_url)}" target="_blank" rel="noreferrer">打开拼多多商家后台登录页</a></p>`;
+      <h2>还不能登录</h2>
+      <p class="small">${esc(data.message || "请先装好本机浏览器组件")}</p>
+      ${data.official_login_url ? `<p><a href="${esc(data.official_login_url)}" target="_blank" rel="noreferrer">打开拼多多商家后台登录页</a></p>` : ""}`;
     return;
   }
   state.ticket = data.ticket;
+  if (data.mode === "live") {
+    panel.innerHTML = `
+      ${switcher}
+      <h2>用商家版扫码登录</h2>
+      <div class="qr-wrap" id="qr-slot"><img id="live-qr" alt="拼多多商家登录二维码" hidden /></div>
+      <p class="small" id="login-status">${esc(data.hint || data.message || "")}</p>
+      <p class="small muted">弹出的窗口就是商家后台。请用「拼多多商家版」扫码，验证码也在那个窗口里完成。Cookie 只留在这台电脑。</p>
+      <div class="actions">
+        <button class="btn ghost" type="button" data-act="refresh-qr">重新打开登录</button>
+        <a class="btn" href="${esc(data.official_login_url)}" target="_blank" rel="noreferrer">登录页地址</a>
+      </div>`;
+    poll(gen, data.ticket);
+    return;
+  }
   panel.innerHTML = `
     ${switcher}
     <div class="qr-wrap" id="qr-slot"></div>
@@ -221,11 +235,27 @@ async function poll(gen, ticket) {
   try {
     const status = await api(`/api/auth/qr/${encodeURIComponent(ticket)}`);
     if (gen !== pollGen) return;
+    const note = document.getElementById("login-status");
+    if (note && status.message) note.textContent = status.message;
+    const img = document.getElementById("live-qr");
+    if (img && status.qr_image && img.getAttribute("src") !== status.qr_image) {
+      img.src = status.qr_image;
+      img.hidden = false;
+    }
     if (status.status === "confirmed") {
+      if (status.message) toast(status.message);
       await boot();
       return;
     }
+    if (status.status === "failed") {
+      toast(status.message || "登录失败");
+      return;
+    }
     if (status.status === "expired") {
+      if (img) {
+        if (note) note.textContent = status.message || "二维码已过期，请重新打开登录";
+        return;
+      }
       toast("二维码已过期，已刷新");
       startQr();
       return;
@@ -250,7 +280,7 @@ function renderShell() {
       <aside class="sidebar">
         <div class="brand"><div class="brand-mark">推</div><div><strong>推广台</strong><span>${esc(shop.name)}</span></div></div>
         <nav class="nav">${nav}</nav>
-        <div class="aside-foot">模拟店铺 ${esc(shop.mall_id)}<br>最近同步 ${esc(when(state.lastSync?.finished_at))}</div>
+        <div class="aside-foot">${state.session.mode === "live" ? "真实店铺" : "模拟店铺"} ${esc(shop.mall_id)}<br>最近同步 ${esc(when(state.lastSync?.finished_at))}</div>
       </aside>
       <main class="main">
         <header class="topbar">
@@ -405,7 +435,13 @@ function renderCampaigns(items) {
 }
 
 function renderImages(items) {
-  if (!items.length) return `<p class="empty">没有测图。</p>`;
+  if (!items.length) {
+    const live = state.session && state.session.mode === "live";
+    const text = live
+      ? "真实报表若只有商品维度，这里会是空的。测图需要报表里带创意或主图。"
+      : "没有测图。";
+    return `<p class="empty">${text}</p>`;
+  }
   const maxCtr = Math.max(...items.map((row) => row.ctr || 0), 0.01);
   return `<div class="cards">${items.map((row) => `
     <article class="image-card">
@@ -530,7 +566,7 @@ function renderSettings(payload) {
         const options = field.choices.map((choice) => `<option value="${esc(choice.value)}" ${choice.value === value ? "selected" : ""}>${esc(choice.label)}</option>`).join("");
         control = `<select data-setting="${esc(field.key)}">${options}</select>`;
       } else {
-        const step = field.type === "int" ? "1" : "0.01";
+        const step = field.type === "int" ? "1" : "any";
         control = `<input data-setting="${esc(field.key)}" type="number" step="${step}" min="${field.min}" max="${field.max}" value="${esc(value)}" />`;
       }
       return `<div class="field"><label>${esc(field.label)}</label>${control}<div class="help">${esc(field.help)}</div></div>`;
@@ -545,7 +581,7 @@ function renderSettings(payload) {
         <li>店铺合计用测款日报。推广计划单独看，模拟数据里两者按商品归集后一致。</li>
         <li>测图是创意层，不加进店铺花费，避免一张图把商品花费算两次。</li>
         <li>ROI = 成交额 / 花费。点击率 = 点击 / 曝光。转化率 = 订单 / 点击。</li>
-        <li>模拟成交额 = 订单 × 标价。真实接入后应改用平台报表里的支付金额。</li>
+        <li>模拟成交额 = 订单 × 标价。真实店铺用报表里的交易额。表格按元；接口里的整数按分、小数按元。若和后台差 100 倍，以后台为准。</li>
         <li>调整方案看最近 7 个完整日。查看今天时，测款和测图仍截止到昨天；只有预算节奏用今天的花费。</li>
       </ul>
       <h2>本地数据</h2>

@@ -159,7 +159,7 @@ td.name { white-space: normal; min-width: 140px; }
 .points div { background: rgba(255,253,251,0.7); border-radius: 14px; padding: 12px 14px; }
 .login-card { padding: 22px; }
 .qr-wrap { background: white; border-radius: 16px; padding: 12px; display: grid; place-items: center; min-height: 240px; }
-.qr-wrap svg { width: 220px; height: 220px; }
+.qr-wrap svg, .qr-wrap img { width: 220px; height: 220px; object-fit: contain; }
 .mode-switch { display: flex; gap: 8px; margin-bottom: 12px; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .field label { font-size: 13px; font-weight: 650; }

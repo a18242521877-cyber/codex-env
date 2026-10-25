@@ -10,7 +10,9 @@ APP_NAME = "推广台"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 OFFICIAL_LOGIN_URL = "https://mms.pinduoduo.com/login/"
+OFFICIAL_PROMO_URL = "https://yingxiao.pinduoduo.com/mains/account/report"
 QR_TTL_SECONDS = 120
+LIVE_LOGIN_SECONDS = 180
 SESSION_DAYS = 7
 HISTORY_DAYS = 15
 RULE_DAYS = 7
@@ -23,10 +25,10 @@ SETTING_FIELDS: list[dict] = [
         "label": "数据模式",
         "type": "enum",
         "choices": [
+            {"value": "live", "label": "真实店铺"},
             {"value": "mock", "label": "模拟店铺"},
-            {"value": "live", "label": "真实店铺（尚未接入）"},
         ],
-        "help": "模拟模式可完整体验。真实模式不会伪造登录，也不会把会话发到别处。",
+        "help": "真实店铺会在本机弹出浏览器，打开拼多多商家后台扫码。Cookie 只留在这台电脑。模拟店铺不联网，用来演示。",
     },
     {
         "key": "refresh_interval_minutes",
@@ -35,7 +37,7 @@ SETTING_FIELDS: list[dict] = [
         "type": "int",
         "min": 0,
         "max": 240,
-        "help": "0 表示只在你点击同步时更新。登录状态下按间隔重拉模拟数据。",
+        "help": "0 表示只在你点击同步时更新。真实店铺自动同步会弹出浏览器，间隔建议设为 0，需要时再手动同步。",
     },
     {
         "key": "target_roi",
@@ -220,7 +222,7 @@ SETTING_FIELDS: list[dict] = [
 ]
 
 DEFAULT_SETTINGS: dict[str, str] = {
-    "data_mode": "mock",
+    "data_mode": "live",
     "refresh_interval_minutes": "30",
     "target_roi": "2",
     "pause_roi": "1",

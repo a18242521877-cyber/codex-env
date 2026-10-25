@@ -6,7 +6,7 @@ from datetime import datetime
 
 from app.adapters import get_adapter
 from app.adapters.base import SyncPayload
-from app.db import log_op
+from app.db import database_path, log_op
 from app.errors import AdapterNotReady, AppError
 from app.timeutil import iso, now_local
 
@@ -23,14 +23,10 @@ def sync_account(conn: sqlite3.Connection, *, mode: str, now: datetime | None = 
     conn.commit()
     run_id = int(cur.lastrowid)
     try:
-        payload = get_adapter(mode).fetch(today=now.date(), now=now)
-        counts = _persist(conn, payload, synced_at=iso(now_local()))
-        message = (
-            f"已同步 {payload.shop.name}：计划 {counts['campaigns']}，"
-            f"测款 {counts['goods']}，测图 {counts['images']}，"
-            f"覆盖 {counts['days']} 天"
-        )
-        _finish(conn, run_id, payload.shop.shop_id, "success", message)
+        payload = get_adapter(mode, database_path(conn)).fetch(today=now.date(), now=now)
+        counts = persist_payload(conn, payload, synced_at=iso(now_local()))
+        message = describe_sync(payload, counts)
+        finish_run(conn, run_id, payload.shop.shop_id, "success", message)
         log_op(conn, "同步", message)
         return {
             "ok": True,
@@ -40,14 +36,34 @@ def sync_account(conn: sqlite3.Connection, *, mode: str, now: datetime | None = 
             **counts,
         }
     except AdapterNotReady as exc:
-        _finish(conn, run_id, None, "failed", str(exc))
+        finish_run(conn, run_id, None, "failed", str(exc))
+        raise
+    except AppError as exc:
+        finish_run(conn, run_id, None, "failed", str(exc))
         raise
     except Exception as exc:
         logger.exception("sync failed")
-        _finish(conn, run_id, None, "failed", "同步失败")
-        if isinstance(exc, AppError):
-            raise
+        finish_run(conn, run_id, None, "failed", "同步失败")
         raise AppError("同步失败", status=500, code="sync_failed") from exc
+
+
+def persist_payload(conn: sqlite3.Connection, payload: SyncPayload, *, synced_at: str) -> dict:
+    return _persist(conn, payload, synced_at=synced_at)
+
+
+def describe_sync(payload: SyncPayload, counts: dict) -> str:
+    message = (
+        f"已同步 {payload.shop.name}：计划 {counts['campaigns']}，"
+        f"测款 {counts['goods']}，测图 {counts['images']}，"
+        f"覆盖 {counts['days']} 天"
+    )
+    if payload.note:
+        message = f"{message}。{payload.note}"
+    return message
+
+
+def finish_run(conn, run_id: int, shop_id: str | None, status: str, message: str) -> None:
+    _finish(conn, run_id, shop_id, status, message)
 
 
 def _finish(conn, run_id: int, shop_id: str | None, status: str, message: str) -> None:

@@ -151,9 +151,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/sync":
             mode = load_settings(conn).data_mode
-            if session["mode"] == "mock" and mode == "live":
+            if session["mode"] != mode:
                 raise AppError(
-                    "当前登录的是模拟店铺。要停在真实接口边界，请先退出，再把数据模式改成真实店铺。",
+                    "当前登录和数据模式不一致。请退出后，按现在的模式重新扫码。",
                     status=409,
                     code="mode_mismatch",
                 )

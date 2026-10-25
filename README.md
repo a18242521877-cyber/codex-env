@@ -2,14 +2,15 @@
 
 拼多多店铺的本机推广监控。扫码登录后查看推广计划、测图、测款，并生成**每日总结**和**调整方案**。
 
-默认是一家虚构店铺「云岭家居旗舰店」，不连真实后台也能把整条流程走完。真实店铺模式只保留接入边界：不会伪造扫码，也不会把 Cookie 送到别的机器。
+新安装默认是**真实店铺**：在本机弹出浏览器，打开 [拼多多商家后台](https://mms.pinduoduo.com/login/)，用「拼多多商家版」扫码。登录后的 Cookie 只留在这台电脑上。没有账号时，登录页可以改成**模拟店铺**，用虚构的「云岭家居旗舰店」把流程走完。
 
 ## 技术选型
 
 - **Python 3.11+** 和标准库里的 HTTP 服务、SQLite。Windows 上装好 Python 就能跑，不需要 Node.js。
 - **界面是本机网页**，由 Python 只在 `127.0.0.1` 上提供。中文、离线，不从 CDN 拉字体或脚本。
-- **Windows 桌面窗口用 pywebview**，底层是系统自带的 Edge WebView2。没有装这个库时，自动改用系统浏览器打开同一地址。
-- **规则在本地计算**。每日总结和调整方案不调用外部大模型，经营数据不出这台电脑。
+- **Windows 桌面窗口用 pywebview**，底层是系统自带的 Edge WebView2。没有装这个库时，自动改用系统浏览器打开同一地址。这扇窗口只是推广台自己的界面。
+- **真实店铺登录用 Playwright**。优先启动本机 Microsoft Edge；没有 Edge 时用 Playwright 下载的 Chromium。浏览器里打开的是商家后台官方页面，由店主自己扫码。验证码、短信也在这个窗口里完成。
+- **规则在本地计算**。每日总结和调整方案读的是已经写入 SQLite 的数字，不调用外部大模型，经营数据不出这台电脑。
 
 没有选用 Electron：体积大，而且这台工具的工作主要是本地数据和规则，不需要一套 Node 构建。
 
@@ -26,14 +27,14 @@
 
 另外做了这些：
 
-1. 模拟店铺，无账号可完整体验
+1. 真实店铺扫码登录，或模拟店铺无账号体验
 2. 可解释的本地规则，阈值能改
 3. 今天的预算节奏（消耗偏快 / 偏慢）
 4. 建议可标记已执行或已忽略，重新计算不会丢掉状态
 5. 预警列表
 6. 导出 UTF-8 BOM 的 CSV（Excel 可直接打开中文）和 Markdown 日报
 7. 复制调整方案、打印日报
-8. 登录后按间隔自动同步（默认 30 分钟，可关）
+8. 登录后按间隔自动同步（默认 30 分钟，可关）。真实店铺自动同步会再弹出浏览器
 9. 操作日志
 10. 清空本地数据（设置保留）
 11. 页面里的口径说明
@@ -49,8 +50,13 @@
 py -3 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements-windows.txt
+python -m playwright install chromium
 python run.py
 ```
+
+`python -m playwright install chromium` 会下载一套 Chromium。电脑上已经有 Edge 时，登录窗口会优先用 Edge，但这条安装命令仍然建议执行，避免 Edge 启动失败时没有退路。
+
+WebView2 一般随 Windows 11 和较新的 Windows 10 提供。若推广台自己的窗口提示缺少运行库，安装微软的 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)，或先用 `--browser`。商家登录用的是 Edge / Chromium，不是这扇 WebView2 窗口。
 
 也可以在装好依赖后双击仓库根目录的 `启动推广台.bat`。脚本会优先使用 `.venv`。
 
@@ -72,28 +78,36 @@ python run.py --serve
 python run.py --port 8766
 ```
 
-WebView2 一般随 Windows 11 和较新的 Windows 10 提供。若提示缺少运行库，安装微软的 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)，或先用 `--browser`。
-
 ### macOS / Linux
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium
 python run.py --browser
 ```
 
-`requirements.txt` 只有二维码库。桌面窗口的 `pywebview` 写在 `requirements-windows.txt`，避免在没有 GTK/Qt 的环境里安装失败。
+`requirements.txt` 含二维码、Playwright 和读取 xlsx 的 openpyxl。桌面窗口的 `pywebview` 写在 `requirements-windows.txt`，避免在没有 GTK/Qt 的环境里安装失败。
 
 ## 登录
 
-1. 打开后默认是**模拟店铺**。页面上有二维码，旁边按钮是「模拟已在手机确认」。
-2. 二维码内容是本机票据 `pddmon://mock-confirm?...`，手机去扫**不会**登录拼多多。
-3. 确认后进入云岭家居旗舰店，并写入近 15 天演示数据。
-4. **退出**只删除本机登录会话，历史报表还在。
-5. 设置里改成**真实店铺**后，登录会停住并说明原因，同时给出商家后台登录页 `https://mms.pinduoduo.com/login/`。
+### 真实店铺
 
-真实接入要做的事写在 `app/adapters/pdd_live.py`：本机 WebView2 打开官方登录页、Cookie 只留在本机、把店主本来就能看到的计划 / 创意 / 商品报表映射进来。当前调用会直接返回「尚未接入」，不会去拼请求。
+1. 打开推广台。新安装的数据模式是「真实店铺」。已经用过的库会保留你上次保存的选择，在登录页点「真实店铺」即可。
+2. 程序弹出 Edge（或 Chromium），打开 `https://mms.pinduoduo.com/login/`。请用**拼多多商家版** App 扫这个窗口里的二维码。个人版拼多多扫不了商家后台。
+3. 推广台页面上会尽量截一张同样的二维码。截不到时，直接扫弹出的窗口。短信或验证码在那个窗口里自己完成，程序不会代点、也不会绕过。
+4. 扫码成功后，浏览器会再打开推广报表页（`https://yingxiao.pinduoduo.com/mains/account/report` 等），收下页面自己请求到的数据。如果页面上已经有「下载 / 导出」，会尝试点已有文件；**不会**点「生成报表」，避免在账号里堆出新报表。
+5. 会话写在数据库旁边的 `pdd-session/storage_state.json`，权限尽量收成只有当前用户能读。数据库里的会话标记只是 `storage` 这几个字，不保存 Cookie 原文。
+6. **退出**会关掉这次登录，并删除 `pdd-session` 里的文件。已经同步进 SQLite 的报表还在。
+
+真实店铺没有登录文件时，点「同步」会提示先扫码，不会编造数字。
+
+### 模拟店铺
+
+1. 登录页改成「模拟店铺」。二维码内容是本机票据 `pddmon://mock-confirm?...`，手机去扫**不会**登录拼多多。
+2. 点「模拟已在手机确认」进入云岭家居旗舰店，并写入近 15 天演示数据。
+3. 退出只删除本机登录会话，历史报表还在。
 
 ## 数据放在哪
 
@@ -107,7 +121,14 @@ python run.py --browser
 - `PDD_MONITOR_DB`：SQLite 文件路径
 - `PDD_MONITOR_PORT`：端口
 
-复制这个 sqlite 文件就是备份。退出登录不会删它。设置页「清空本地数据」会删店铺和报表，阈值保留。
+复制这个 sqlite 文件就是备份。真实店铺的浏览器会话在它旁边：
+
+```text
+pdd-session/storage_state.json   登录态。退出登录或清空数据时删除
+pdd-session/last_capture.json    最近一次收下的报表正文摘要，不含 Cookie 请求头
+```
+
+退出登录不会删 sqlite 里的报表。设置页「清空本地数据」会删店铺、报表和上面的会话文件，阈值保留。这两个文件不要打包发走，也不要提交到仓库。
 
 服务只监听 `127.0.0.1`。会改数据的请求还要带本机页面才会加的请求头，避免别的网页顺手调用。
 
@@ -117,8 +138,10 @@ python run.py --browser
 - **推广计划**单独展示。模拟数据里，计划数字等于名下商品之和。
 - **测图**是创意层，不计入店铺花费。
 - ROI = 成交额 / 花费。点击率 = 点击 / 曝光。转化率 = 订单 / 点击。
-- 模拟成交额 = 订单 × 标价。接到真实报表后，应改用平台的支付金额，不要沿用标价。
+- 模拟成交额 = 订单 × 标价。真实店铺用报表里的交易额，不再用标价去乘。
 - 金额在库里用「分」，页面上用「元」。
+- 真实报表的金额没有统一单位。CSV / xlsx 按「元」；JSON 里的整数按「分」，小数按「元」。后台若改口径，花费可能差 100 倍，请对照商家后台核对，不要只信这里的换算。
+- 测图只有报表里出现创意或主图维度才有。很多店铺只有商品报表，测图页会是空的，这不是同步失败。
 
 ## 调整规则
 
@@ -159,16 +182,23 @@ run.py                      入口
 app/cli.py                  窗口 / 浏览器 / 只开服务
 app/server.py               本机接口
 app/scheduler.py            自动同步
-app/adapters/mock.py        模拟店铺
-app/adapters/pdd_live.py    真实接口边界
+app/adapters/mock.py         模拟店铺
+app/adapters/pdd_live.py     真实店铺：本机浏览器
+app/adapters/pdd_browser.py  Playwright 登录、报表捕获
+app/adapters/pdd_normalize.py  JSON / CSV / xlsx 收成统一报表
 app/services/               同步、日报、调整方案、导出
 app/ui/                     中文界面
 tests/test_smoke.py         规则和自检
+tests/test_live_normalize.py 报表归一化，不联网
+tests/test_live_browser.py  本地夹具页；没有 Chromium 时跳过
 ```
 
 ## 验收清单
 
 - [ ] Windows 上按上面的步骤能打开窗口或浏览器
+- [ ] 登录页选「真实店铺」会弹出 Edge 或 Chromium，打开商家后台登录页
+- [ ] 用拼多多商家版扫码后，总览、每日总结、调整方案里是这家店的数字
+- [ ] 退出后 `pdd-session` 会话文件被删掉，再打开需要重新扫码；已同步的报表还在
 - [ ] 模拟扫码（点「模拟已在手机确认」）能进入云岭家居旗舰店
 - [ ] 退出后回到登录页，再登录仍能看到历史
 - [ ] 总览能看到花费、成交额、ROI、订单
@@ -178,12 +208,14 @@ tests/test_smoke.py         规则和自检
 - [ ] 每日总结是中文，含环比；今天的总结会标明未完结
 - [ ] 调整方案里有放量、暂停、换主图，并能标记已执行
 - [ ] 导出的 CSV 用 Excel 打开中文不乱码
-- [ ] 切到真实店铺时不会伪造登录，并说明原因
-- [ ] `python run.py --self-test` 通过
+- [ ] 报表没有创意维度时，测图页说明为空，而不是补造主图
+- [ ] `python run.py --self-test` 通过（不需要拼多多账号）
 
 ## 已知限制
 
-- 真实拼多多商家后台没有接上。演示数据是按规则编的，不是某家店的真实成绩。
+- 拼多多没有稳定的公开推广 API。本工具不猜测签名，也不绕过风控。能拿到的数据，只是登录后官方页面自己加载或允许下载的那一部分。页面改版后，二维码可能截不到、字段可能对不上。对不上时会提示没识别到，并保留登录，方便你打开报表后再同步。
+- 自动同步在真实店铺下会弹出浏览器。不想被打断，把间隔设为 0，需要时再点「同步」。
+- 演示店铺的数字是按规则编的，不是某家店的真实成绩。
 - 调整方案是规则，不是自动改价、改预算。
 - 单用户、单机。没有账号体系和云同步。
 - 不提供单文件安装包。Windows 上以 Python 源码运行。

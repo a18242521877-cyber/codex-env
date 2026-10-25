@@ -7,12 +7,15 @@ import json
 import os
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 
+from app.adapters.scripted_driver import ScriptedLiveDriver
 from app.server import AppServer
+from app.services.live_login import use_driver
 
 
 def _keepalive_ok(port: int) -> bool:
@@ -73,6 +76,7 @@ def run_self_test() -> int:
                 payload = raw
             return exc.code, payload
 
+    use_driver(ScriptedLiveDriver())
     try:
         status, health = request("GET", "/api/health")
         check("健康检查", status == 200 and health.get("ok") is True, str(health))
@@ -87,18 +91,11 @@ def run_self_test() -> int:
             f"html={status} js={status_js}",
         )
 
+        status, forced = request("PUT", "/api/settings", {"data_mode": "mock"})
+        check("自检先固定模拟模式", status == 200 and forced["values"]["data_mode"] == "mock", str(forced)[:180])
         status, denied = request("POST", "/api/auth/qr", {}, header=False)
         check("缺少本地请求头会被拒绝", status == 403, str(denied))
         check("连续请求不会粘包", _keepalive_ok(httpd.server_address[1]), "POST 之后的 GET 应仍是 200")
-
-        status, live = request("PUT", "/api/settings", {"data_mode": "live"})
-        check("可以切换到真实模式", status == 200 and live["values"]["data_mode"] == "live", str(live))
-        status, qr = request("POST", "/api/auth/qr", {})
-        check(
-            "真实模式不伪造扫码",
-            status == 200 and qr.get("ready") is False and "mms.pinduoduo.com" in qr.get("official_login_url", ""),
-            str(qr),
-        )
 
         status, bad = request("PUT", "/api/settings", {"pause_roi": "9", "target_roi": "2"})
         check("非法阈值会被拒绝", status == 400, str(bad))
@@ -184,7 +181,52 @@ def run_self_test() -> int:
         check("清空本地数据", status == 200 and reset.get("ok") is True, str(reset))
         status, session = request("GET", "/api/session")
         check("清空后需要重新登录", status == 200 and session.get("logged_in") is False, str(session))
+
+        status, live = request("PUT", "/api/settings", {"data_mode": "live"})
+        check("可以切换到真实模式", status == 200 and live["values"]["data_mode"] == "live", str(live)[:180])
+        status, qr = request("POST", "/api/auth/qr", {})
+        dumped = json.dumps(qr, ensure_ascii=False)
+        check(
+            "真实模式打开扫码而不是演示码",
+            status == 200
+            and qr.get("ready") is True
+            and qr.get("mode") == "live"
+            and qr.get("ticket")
+            and "pddmon://" not in dumped
+            and "mms.pinduoduo.com" in qr.get("official_login_url", ""),
+            dumped[:240],
+        )
+        live_ticket = qr.get("ticket", "")
+        polled = {}
+        for _ in range(40):
+            status, polled = request("GET", f"/api/auth/qr/{live_ticket}")
+            if polled.get("status") in {"confirmed", "failed", "expired"}:
+                break
+            time.sleep(0.05)
+        check("真实模式扫码后进入店铺", status == 200 and polled.get("status") == "confirmed", str(polled)[:240])
+        status, session = request("GET", "/api/session")
+        check(
+            "会话标记为真实店铺",
+            status == 200 and session.get("logged_in") is True and session.get("mode") == "live" and session.get("shop", {}).get("name") == "夹具真实店",
+            str(session),
+        )
+        storage = db_path.parent / "pdd-session" / "storage_state.json"
+        check("会话文件只留在本机数据库旁边", storage.is_file() and "cookie" not in session)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        status, summary = request("GET", f"/api/summary?date={yesterday}")
+        narrative = summary.get("narrative", "") if isinstance(summary, dict) else ""
+        check(
+            "真实数据进入每日总结",
+            status == 200 and "夹具真实店" in narrative and "500.00" in narrative,
+            narrative[:240],
+        )
+        status, plan = request("GET", f"/api/plans?date={yesterday}")
+        live_actions = {item["action"] for item in plan.get("items", [])} if isinstance(plan, dict) else set()
+        check("真实数据进入调整方案", "goods_pause" in live_actions, str(sorted(live_actions)))
+        status, logged_out = request("POST", "/api/auth/logout", {})
+        check("退出真实店铺并删除会话文件", status == 200 and logged_out.get("logged_in") is False and not storage.exists(), str(logged_out))
     finally:
+        use_driver(None)
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)

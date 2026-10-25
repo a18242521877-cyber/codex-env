@@ -62,6 +62,7 @@ class SyncPayload:
     goods_days: dict[str, list[MetricDay]] = field(default_factory=dict)
     images: list[ImageInfo] = field(default_factory=list)
     image_days: dict[str, list[MetricDay]] = field(default_factory=dict)
+    note: str = ""
 
 
 class PromoAdapter(Protocol):

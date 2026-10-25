@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.adapters.pdd_live import PddLiveAdapter
 from app.db import connect, init_db
-from app.errors import AdapterNotReady, AppError
+from app.errors import AppError
 from app.metrics import classify_pace
 from app.selftest import run_self_test
 from app.services.auth import confirm_ticket, create_login_ticket, logout, public_session
@@ -99,9 +99,11 @@ class RuleTests(unittest.TestCase):
             update_settings(self.conn, {"pause_roi": "5", "target_roi": "2"})
         self.assertEqual(load_settings(self.conn).pause_roi, 1)
 
-    def test_live_adapter_is_explicitly_not_ready(self):
-        with self.assertRaises(AdapterNotReady):
-            PddLiveAdapter().fetch(today=self.now.date(), now=self.now)
+    def test_live_adapter_without_session_asks_to_scan(self):
+        adapter = PddLiveAdapter(Path(self.tmp.name) / "rules.sqlite")
+        with self.assertRaises(AppError) as caught:
+            adapter.fetch(today=self.now.date(), now=self.now)
+        self.assertIn("扫码", str(caught.exception))
 
     def test_pace_classifier(self):
         settings = load_settings(self.conn)

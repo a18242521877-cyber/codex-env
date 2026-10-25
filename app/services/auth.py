@@ -4,7 +4,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta
 
-from app.config import OFFICIAL_LOGIN_URL, QR_TTL_SECONDS, SESSION_DAYS
+from app.config import QR_TTL_SECONDS, SESSION_DAYS
 from app.db import log_op
 from app.errors import AppError, AuthError
 from app.qrsvg import make_qr_svg
@@ -57,17 +57,12 @@ def create_login_ticket(conn: sqlite3.Connection, mode: str, now: datetime | Non
         raise AppError("未知数据模式")
     now = now or now_local()
     if mode == "live":
-        log_op(conn, "登录", "尝试真实店铺登录，已停在适配器边界")
-        return {
-            "ready": False,
-            "mode": "live",
-            "official_login_url": OFFICIAL_LOGIN_URL,
-            "message": (
-                "真实店铺还未接入。拼多多商家后台没有稳定的公开报表 API，"
-                "推广台不会伪造扫码，也不会保存或上传你的 Cookie。"
-                "你可以在浏览器打开官方登录页自己查看后台；要在本工具里看数，请改用模拟店铺。"
-            ),
-        }
+        from app.services.live_login import start_live_login
+
+        return start_live_login(conn, now)
+    from app.services.live_login import cancel_jobs
+
+    cancel_jobs()
     ticket = secrets.token_urlsafe(18)
     expires = now + timedelta(seconds=QR_TTL_SECONDS)
     payload = f"pddmon://mock-confirm?ticket={ticket}"
@@ -95,6 +90,10 @@ def poll_ticket(conn: sqlite3.Connection, ticket: str, now: datetime | None = No
     row = conn.execute("SELECT * FROM login_tickets WHERE ticket = ?", (ticket,)).fetchone()
     if row is None:
         raise AppError("登录票据不存在", status=404, code="ticket_missing")
+    if row["mode"] == "live":
+        from app.services.live_login import poll_live_job
+
+        return poll_live_job(conn, ticket, row, now)
     status = row["status"]
     if status == "pending" and parse_dt(row["expires_at"]) <= now:
         conn.execute("UPDATE login_tickets SET status = 'expired' WHERE ticket = ?", (ticket,))
@@ -145,6 +144,12 @@ def confirm_ticket(conn: sqlite3.Connection, ticket: str, now: datetime | None =
 
 
 def logout(conn: sqlite3.Connection) -> dict:
+    from app.adapters.pdd_session import remove_session_files
+    from app.db import database_path
+    from app.services.live_login import cancel_jobs
+
+    cancel_jobs()
+    remove_session_files(database_path(conn))
     session = public_session(conn)
     with conn:
         conn.execute("DELETE FROM sessions WHERE id = 1")

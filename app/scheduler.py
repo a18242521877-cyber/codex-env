@@ -1,4 +1,4 @@
-"""登录后按设置间隔重拉数据。真实模式不会在这里伪造请求。"""
+"""登录后按设置间隔重拉数据。真实店铺会弹出本机浏览器。"""
 
 from __future__ import annotations
 
@@ -46,17 +46,24 @@ class Scheduler:
             init_db(conn)
             settings = load_settings(conn)
             interval = settings.refresh_interval_minutes
-            if interval <= 0 or settings.data_mode != "mock":
+            if interval <= 0:
                 return
             session = public_session(conn)
-            if not session["logged_in"] or session["mode"] != "mock":
+            if not session["logged_in"] or session["mode"] != settings.data_mode:
+                return
+            if session["mode"] not in {"mock", "live"}:
                 return
             previous = last_sync(conn)
             if previous and previous.get("finished_at"):
                 due = parse_dt(previous["finished_at"]) + timedelta(minutes=interval)
                 if due > datetime.now().astimezone():
                     return
-            sync_account(conn, mode="mock")
+            if session["mode"] == "live":
+                from app.services.live_login import browser_is_busy
+
+                if browser_is_busy():
+                    return
+            sync_account(conn, mode=session["mode"])
         except AppError as exc:
             logger.info("跳过自动同步：%s", exc)
         finally:

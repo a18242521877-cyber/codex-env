@@ -1,39 +1,39 @@
-"""拼多多商家后台接入边界。
+"""拼多多商家后台。登录和报表都走本机浏览器里的官方页面。
 
-这个文件故意不实现抓取。
-
-商家后台（mms.pinduoduo.com）的扫码登录和推广报表没有稳定、公开、
-可供第三方调用的 API。页面接口会变，也带风控。把 Cookie 或请求签名写进
-程序、再拿去请求非官方接口，既容易失效，也不该把店铺会话送到别的机器。
-
-本工具只在店主自己的电脑上保存会话。后续如果接入，应当：
-
-- 用本机 WebView2 打开官方登录页，由店主自己扫码
-- Cookie 只进本机数据库，退出登录时删除
-- 读取店主在后台本来就能看到的计划、创意、商品报表
-- 创意报表映射到测图，商品报表映射到测款
-- 字段对不上时保留原始 JSON，不要静默算错 ROI
-
-当前调用会抛出 AdapterNotReady，界面会说明原因。
+没有稳定的公开推广 API。这里不拼签名、不绕过验证码，只在店主扫码后的
+会话里打开报表页，收下页面自己加载或下载的数据。字段对不上时见
+`pdd_normalize.py`：宁可提示没识别到，也不编造数字。
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 
 from app.adapters.base import SyncPayload
-from app.errors import AdapterNotReady
+from app.adapters.pdd_session import storage_state_path
+from app.errors import AppError
 
-_MESSAGE = (
-    "还没有接入拼多多商家后台。"
-    "官方没有稳定的公开推广报表 API，本工具不会伪造扫码登录，"
-    "也不会把 Cookie 发到其他服务器。"
-    "请先用「模拟店铺」体验全部功能；接入时应只在本机保存你自己扫码得到的会话。"
-)
+_SCAN = "请先扫码登录真实店铺。打开登录页后，用拼多多商家版扫描二维码。"
 
 
 class PddLiveAdapter:
     mode = "live"
 
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(db_path)
+
     def fetch(self, *, today: date, now: datetime) -> SyncPayload:
-        raise AdapterNotReady(_MESSAGE)
+        del now
+        if not storage_state_path(self.db_path).is_file():
+            raise AppError(_SCAN, status=409, code="login_required")
+        from app.services.live_login import acquire_browser, current_driver, release_browser
+
+        driver = current_driver()
+        driver.check_ready()
+        if not acquire_browser(0):
+            raise AppError("浏览器正忙，请稍后再试", status=409, code="browser_busy")
+        try:
+            return driver.collect(self.db_path, today=today)
+        finally:
+            release_browser()

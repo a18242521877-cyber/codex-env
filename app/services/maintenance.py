@@ -26,6 +26,12 @@ _TABLES = [
 def reset_local_data(conn: sqlite3.Connection, confirm: str) -> dict:
     if confirm != "清空":
         raise AppError("请输入「清空」以确认。设置项会保留。")
+    from app.adapters.pdd_session import remove_session_files
+    from app.db import database_path
+    from app.services.live_login import cancel_jobs
+
+    cancel_jobs()
+    remove_session_files(database_path(conn))
     with conn:
         for table in _TABLES:
             conn.execute(f"DELETE FROM {table}")

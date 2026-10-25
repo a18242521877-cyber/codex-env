@@ -185,6 +185,13 @@ CREATE INDEX IF NOT EXISTS idx_image_daily_shop_date ON image_daily(shop_id, sta
 _SETTING_KEYS = {field["key"] for field in SETTING_FIELDS}
 
 
+def database_path(conn: sqlite3.Connection) -> Path:
+    for row in conn.execute("PRAGMA database_list"):
+        if row["name"] == "main" and row["file"]:
+            return Path(row["file"])
+    raise RuntimeError("找不到数据库文件")
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
