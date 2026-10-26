@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.sqlite
+*.sqlite-*
+*.sqlite-journal
+pdd-session/
+.DS_Store
+Thumbs.db
+build/
+dist/
+*.spec
+*.egg-info/
