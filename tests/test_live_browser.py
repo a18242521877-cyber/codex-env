@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +81,32 @@ EFFECT_HTML = """<!doctype html><html><body>
 <script>fetch("/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms");</script>
 </body></html>"""
 SSO_HTML = """<!doctype html><html><body><p>推广中心授权</p></body></html>"""
+SSO_BUTTON_HTML = """<!doctype html><html><body>
+<button type="button" id="enter">推广中心</button>
+<script>
+document.getElementById("enter").onclick = function () {
+  location.href = "/goods/report/promotion/overView";
+};
+</script>
+</body></html>"""
+REPORT_DIM_HTML = """<!doctype html><html><body>
+<button type="button" id="goods">商品</button>
+<button type="button" id="creative">创意</button>
+<script>
+fetch("/api/goods/promotion/list.json");
+document.getElementById("creative").onclick = function () {
+  fetch("/api/creative/list.json");
+};
+</script>
+</body></html>"""
+CREATIVE_JSON = """{
+  "mallId": 753391861,
+  "mallName": "御品渔获专营店",
+  "result": {"list": [
+    {"statDate": "2026-10-24", "creativeId": "c1", "creativeName": "主图A", "goodsId": 9001,
+     "goodsName": "渔获单品", "impression": 40, "click": 4, "spend": 1.5, "gmv": 6, "orderNum": 1}
+  ]}
+}"""
 SYDNEY_JSON = """{
   "success": true,
   "result": {
@@ -127,7 +154,17 @@ class Handler(BaseHTTPRequestHandler):
             "/sycm/goods_effect/detail": ("text/html; charset=utf-8", EFFECT_HTML.encode()),
             "/login/sso": ("text/html; charset=utf-8", SSO_HTML.encode()),
             "/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms": ("application/json", SYDNEY_JSON.encode()),
+            "/goods/report/promotion/overView": ("text/html; charset=utf-8", REPORT_DIM_HTML.encode()),
+            "/api/creative/list.json": ("application/json", CREATIVE_JSON.encode()),
         }
+        if path == "/login/sso" and "ready=1" in self.path:
+            ctype, body = "text/html; charset=utf-8", SSO_BUTTON_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path not in routes:
             body = b"no"
             self.send_response(404)
@@ -301,9 +338,67 @@ class BrowserFixtureTests(unittest.TestCase):
             self.assertEqual(row["spend_fen"], 0)
             self.assertEqual(row["gmv_fen"], 553860)
             self.assertEqual(row["orders"], 122)
-            details = " ".join(item["detail"] for item in conn.execute("SELECT detail FROM operation_logs"))
-            self.assertIn("商品数据", details)
-            self.assertIn("没有写入推广花费", details)
+            last = conn.execute(
+                "SELECT detail FROM operation_logs WHERE action = '同步' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(last)
+            self.assertIn("商品数据", last["detail"])
+            self.assertIn("没有写入推广花费", last["detail"])
+            self.assertIn("测图测款未写入", last["detail"])
+            self.assertNotIn("测款 0", last["detail"])
+            self.assertNotIn("已同步", last["detail"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_sso_button_opens_goods_and_creative_report(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        try:
+            init_db(conn)
+            now = now_local()
+            conn.execute(
+                "INSERT INTO login_tickets(ticket, mode, status, created_at, expires_at) VALUES(?, 'live', 'pending', ?, ?)",
+                ("creative-ticket", iso(now), iso(now)),
+            )
+            conn.commit()
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            driver = PlaywrightLiveDriver(
+                login_url=base + "/login/",
+                report_urls=[base + "/sycm/goods_effect/detail", base + "/login/sso?ready=1"],
+                headless=True,
+                sso_probe_seconds=5,
+                sso_wait_seconds=4,
+            )
+            job = LoginJob("creative-ticket")
+            driver.run(job, db_path)
+            self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            names = [row["name"] for row in conn.execute("SELECT name FROM goods ORDER BY name")]
+            self.assertIn("渔获单品", names)
+            label = conn.execute("SELECT label FROM image_tests").fetchone()
+            self.assertIsNotNone(label)
+            self.assertEqual(label["label"], "主图A")
+            last = conn.execute(
+                "SELECT detail FROM operation_logs WHERE action = '同步' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(last)
+            self.assertIn("测图 1", last["detail"])
+            self.assertIn("测款 1", last["detail"])
+            self.assertNotIn("登录态为空", last["detail"])
+            from app.adapters.pdd_session import capture_path
+
+            raw = capture_path(db_path).read_text(encoding="utf-8")
+            saved = json.loads(raw)
+            self.assertEqual(saved[0]["kind"], "debug")
+            self.assertTrue(any(item.get("promo") and item.get("path") == "/api/creative/list.json" for item in saved if item.get("kind") == "json"))
+            self.assertTrue(any(item.get("path") == "/api/creative/list.json" and item.get("promo") for item in saved[0]["urls"]))
         finally:
             httpd.shutdown()
             httpd.server_close()

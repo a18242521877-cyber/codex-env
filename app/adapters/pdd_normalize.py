@@ -56,6 +56,164 @@ SYDNEY_SOURCE_NOTE = (
     "昨日成交额和订单来自商家后台「商品数据」，不是推广花费。"
     "推广花费需要在弹出的窗口完成一次「推广中心」授权后再同步。"
 )
+AUTH_FAILED_NOTE = (
+    "推广中心未授权 / 登录态为空，测图测款未写入。"
+    "请在弹出的窗口点一次「推广中心」并完成授权，不要关窗口。"
+    "授权完成后会写回推广中心登录态，再同步一次才会写入测款和测图。"
+    "这次没有写入推广花费。"
+)
+_METRIC_KEY_NORMS = {
+    "spend",
+    "cost",
+    "impression",
+    "impressions",
+    "click",
+    "clicks",
+    "showcnt",
+    "clickcnt",
+    "ordernum",
+    "orders",
+    "ordercnt",
+    "gmv",
+    "花费",
+    "消耗",
+    "成交花费",
+    "推广花费",
+    "总花费",
+    "曝光",
+    "曝光量",
+    "展现",
+    "展现量",
+    "点击",
+    "点击量",
+    "成交额",
+    "交易额",
+    "成交金额",
+    "支付金额",
+}
+_GOODS_KEY_NORMS = {"goodsid", "goodsname", "商品id", "商品名称", "商品名"}
+_PLAN_KEY_NORMS = {
+    "planid",
+    "adid",
+    "campaignid",
+    "unitid",
+    "planname",
+    "adname",
+    "campaignname",
+    "计划id",
+    "推广计划id",
+    "计划名称",
+    "推广计划",
+    "计划名",
+}
+_CREATIVE_KEY_NORMS = {
+    "creativeid",
+    "creativename",
+    "imageid",
+    "创意id",
+    "创意名称",
+    "主图",
+    "主图名称",
+}
+
+
+def _key_norm(key: Any) -> str:
+    return str(key).strip().lower().replace("_", "").replace(" ", "")
+
+
+def _structured_hit(body: Any, id_keys: set[str]) -> bool:
+    """同一行上同时有身份字段和指标字段才算报表。说明文字里的「花费」不算。"""
+    found = False
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal found
+        if found or depth > 8:
+            return
+        if isinstance(node, dict):
+            keys = {_key_norm(key) for key in node.keys()}
+            if (keys & id_keys) and (keys & _METRIC_KEY_NORMS):
+                found = True
+                return
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:50]:
+                walk(item, depth + 1)
+
+    walk(body, 0)
+    return found
+
+
+def json_has_metrics(body: Any) -> bool:
+    return _structured_hit(body, _GOODS_KEY_NORMS | _PLAN_KEY_NORMS | _CREATIVE_KEY_NORMS)
+
+
+def json_has_creative_metrics(body: Any) -> bool:
+    return _structured_hit(body, _CREATIVE_KEY_NORMS)
+
+
+def json_has_promo_goods(body: Any) -> bool:
+    return _structured_hit(body, _GOODS_KEY_NORMS | _PLAN_KEY_NORMS)
+
+
+def body_looks_like_mikasa(body: Any) -> bool:
+    """推广接口未登录时常见：mikasaErrorCode，并且 result 是空的。"""
+    found = False
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal found
+        if found or depth > 6:
+            return
+        if isinstance(node, dict):
+            if "mikasaErrorCode" in node or "mikasa_error_code" in node:
+                result = node.get("result", node.get("Result", "missing"))
+                if result in (None, {}, []):
+                    found = True
+                    return
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:20]:
+                walk(item, depth + 1)
+
+    walk(body, 0)
+    return found
+
+
+def body_auth_failed(body: Any) -> bool:
+    """登录态为空或 mikasa 空结果。这是授权失败，不是报表里没有商品。"""
+    if body_looks_like_mikasa(body):
+        return True
+    found = False
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal found
+        if found or depth > 8:
+            return
+        if isinstance(node, dict):
+            message = node.get("errorMsg", node.get("error_msg", node.get("errorMessage")))
+            if isinstance(message, str) and "登录态为空" in message:
+                found = True
+                return
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:30]:
+                walk(item, depth + 1)
+
+    walk(body, 0)
+    return found
+
+
+def note_says_auth_failed(note: str) -> bool:
+    text = note or ""
+    return any(
+        mark in text
+        for mark in ("测图测款未写入", "登录态为空", "没有写入推广花费", "未授权", "授权没有完成")
+    )
 
 
 def money_to_fen(value: Any, *, source: str) -> int:
@@ -174,11 +332,16 @@ def normalize_captures(
     rows: list[tuple[str, dict[str, Any]]] = []
     mall = {"id": "", "name": ""}
     notes: list[str] = []
+    auth_failed = False
+    promo_metrics = False
     for item in captures:
         kind = item.get("kind")
         body = item.get("body")
         if kind == "note" and body:
-            notes.append(str(body).strip()[:300])
+            text = str(body).strip()[:300]
+            notes.append(text)
+            if note_says_auth_failed(text):
+                auth_failed = True
             continue
         if kind == "debug":
             continue
@@ -186,6 +349,10 @@ def normalize_captures(
             data = _load_json(body)
             if data is None:
                 continue
+            if body_auth_failed(data):
+                auth_failed = True
+            if json_has_metrics(data) and not body_auth_failed(data):
+                promo_metrics = True
             sydney_rows = extract_sydney_rows(data, today)
             if sydney_rows:
                 rows.extend(sydney_rows)
@@ -203,6 +370,7 @@ def normalize_captures(
                 row_kind = _kind(mapped)
                 if row_kind and _has_metric(mapped):
                     rows.append((row_kind, {**mapped, "__source": "csv"}))
+                    promo_metrics = True
         elif kind == "xlsx":
             table, error = _xlsx_rows(body)
             if error:
@@ -214,6 +382,9 @@ def normalize_captures(
                 row_kind = _kind(mapped)
                 if row_kind and _has_metric(mapped):
                     rows.append((row_kind, {**mapped, "__source": "xlsx"}))
+                    promo_metrics = True
+    if auth_failed and not promo_metrics and not any(note_says_auth_failed(item) for item in notes):
+        notes.append(AUTH_FAILED_NOTE)
     return _assemble(rows, mall, shop_hint=shop_hint, today=today, notes=notes)
 
 
@@ -458,7 +629,7 @@ def _assemble(
     shop_id = f"live-{_slug(mall_id)}" if mall_id else "live-unknown"
     name = (mall["name"] or shop_hint or "拼多多店铺")[:40]
     note = " ".join(notes)
-    if not goods_meta and not plan_meta:
+    if not goods_meta and not plan_meta and not note_says_auth_failed(note):
         extra = (
             "已登录，但没有从报表里识别到推广商品或计划。"
             "请在弹出的窗口打开推广报表，或下载已经生成好的报表后再同步。"

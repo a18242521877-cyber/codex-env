@@ -51,14 +51,37 @@ def persist_payload(conn: sqlite3.Connection, payload: SyncPayload, *, synced_at
     return _persist(conn, payload, synced_at=synced_at)
 
 
+def _shop_data_goods(goods) -> bool:
+    return goods.category == "商品数据" or "sydney-shop" in goods.goods_id
+
+
+def _shop_data_campaign(campaign) -> bool:
+    return campaign.scene == "商品数据" or campaign.name == "商品数据"
+
+
 def describe_sync(payload: SyncPayload, counts: dict) -> str:
+    """测款、测图只数推广报表。商品数据兜底和授权失败都不能写成「已同步，测款 0」。"""
+    from app.adapters.pdd_normalize import note_says_auth_failed
+
+    campaigns = [item for item in payload.campaigns if not _shop_data_campaign(item)]
+    goods = [item for item in payload.goods if not _shop_data_goods(item)]
+    images = list(payload.images)
+    note = (payload.note or "").strip()
+    sydney = any(_shop_data_goods(item) for item in payload.goods)
+    if note_says_auth_failed(note) and not goods and not images:
+        message = f"{payload.shop.name}：{note}" if note else f"{payload.shop.name}：推广中心未授权 / 登录态为空，测图测款未写入"
+        if sydney and "不是推广测款" not in message:
+            message += " 昨日成交来自商品数据，不是推广测款。"
+        return message
     message = (
-        f"已同步 {payload.shop.name}：计划 {counts['campaigns']}，"
-        f"测款 {counts['goods']}，测图 {counts['images']}，"
+        f"已同步 {payload.shop.name}：计划 {len(campaigns)}，"
+        f"测款 {len(goods)}，测图 {len(images)}，"
         f"覆盖 {counts['days']} 天"
     )
-    if payload.note:
-        message = f"{message}。{payload.note}"
+    if sydney and not goods:
+        message += "。测款未计入商品数据"
+    if note:
+        message = f"{message}。{note}"
     return message
 
 

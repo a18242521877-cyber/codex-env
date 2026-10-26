@@ -209,7 +209,7 @@ async function startQr() {
       <h2>用商家版扫码登录</h2>
       <div class="qr-wrap" id="qr-slot"><img id="live-qr" alt="拼多多商家登录二维码" hidden /></div>
       <p class="small" id="login-status">${esc(data.hint || data.message || "")}</p>
-      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。若窗口停在首页，点一次「推广中心」或「商品推广」。验证码在那个窗口里完成。</p>
+      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。若窗口停在授权页或结果写着「登录态为空」，在那个窗口点一次「推广中心」，不要关窗口。验证码在那个窗口里完成。</p>
       <div class="actions">
         <button class="btn ghost" type="button" data-act="refresh-qr">重新打开登录</button>
         ${data.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
@@ -450,9 +450,13 @@ function renderCampaigns(items) {
 function renderImages(items) {
   if (!items.length) {
     const live = state.session && state.session.mode === "live";
-    const text = live
-      ? "真实报表若只有商品维度，这里会是空的。测图需要报表里带创意或主图。"
-      : "没有测图。";
+    const last = (state.lastSync && state.lastSync.message) || "";
+    let text = "没有测图。";
+    if (live && (last.includes("登录态为空") || last.includes("未授权") || last.includes("测图测款未写入"))) {
+      text = "推广中心未授权 / 登录态为空，测图未写入。请在弹出的窗口点一次「推广中心」完成授权后再同步。";
+    } else if (live) {
+      text = "测图需要推广报表里的创意或主图。若窗口停在授权页，点一次「推广中心」，不要关窗口。";
+    }
     return `<p class="empty">${text}</p>`;
   }
   const maxCtr = Math.max(...items.map((row) => row.ctr || 0), 0.01);
@@ -469,7 +473,13 @@ function renderImages(items) {
 
 function renderGoods(items) {
   if (!items.length) return `<p class="empty">没有测款。</p>`;
-  return `<div class="cards">${items.map((row) => `
+  const shopData = items.filter((row) => row.category === "商品数据");
+  const banner = shopData.length && shopData.length === items.length
+    ? `<p class="banner">这些成交来自商家后台「商品数据」，不是推广测款。测款要等推广报表里的商品维度同步成功。</p>`
+    : shopData.length
+      ? `<p class="banner">标成「商品数据」的是全店成交兜底，不计入推广测款。</p>`
+      : "";
+  return `${banner}<div class="cards">${items.map((row) => `
     <article class="goods-card">
       <div class="split"><span class="pill">${esc(row.stage)}</span><span class="small muted">${esc(row.category)}</span></div>
       <h3>${esc(row.name)}</h3>

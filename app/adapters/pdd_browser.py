@@ -14,9 +14,16 @@ import base64
 import json
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-from app.adapters.pdd_normalize import normalize_captures
+from app.adapters.pdd_normalize import (
+    AUTH_FAILED_NOTE,
+    body_auth_failed,
+    body_looks_like_mikasa,
+    json_has_creative_metrics,
+    json_has_metrics,
+    normalize_captures,
+)
 from app.adapters.pdd_session import (
     PASS_COOKIE_NAMES,
     capture_path,
@@ -39,16 +46,14 @@ SIDEBAR_TARGETS = (
     "https://yingxiao.pinduoduo.com/mains/account/finance",
 )
 GOODS_EFFECT_URL = "https://mms.pinduoduo.com/sycm/goods_effect/detail"
-PROMO_URL_HINTS = ("report", "promotion", "/ad", "advertise", "creative", "campaign", "goods", "plan", "goodsdatashow", "sydney")
+PROMO_URL_HINTS = ("report", "promotion", "/ad", "advertise", "creative", "campaign", "plan", "goodsdatashow", "sydney")
 NAV_LABELS = ("推广概况", "推广中心", "推广平台", "多多招财", "商品推广", "推广报表", "推广账户", "账户报表")
-SSO_STUCK_NOTE = (
-    "推广中心授权没有完成，页面停在登录跳转。"
-    "请在弹出的窗口点一次「推广中心」并完成授权后再同步。"
-    "这次没有写入推广花费。"
-)
+DIMENSION_LABELS = ("商品", "创意", "主图", "推广商品")
+SSO_STUCK_NOTE = AUTH_FAILED_NOTE
 DATE_LABELS = ("近7天", "近7日", "最近7天", "昨天", "近30天", "近30日")
 _MAX_JSON = 36
 _MAX_URLS = 80
+_MAX_JSON_CHARS = 12_000
 def promo_sso_url(target: str) -> str:
     """商家后台跳进营销域名的公开入口。查询参数里只有要打开的页面地址。"""
     return (
@@ -97,29 +102,11 @@ def is_date_preset_label(label: str) -> bool:
     return text in DATE_LABELS
 
 
-def body_looks_like_mikasa(body) -> bool:
-    """推广接口未登录时常见：mikasaErrorCode，并且 result 是空的。"""
-    found = False
-
-    def walk(node, depth: int) -> None:
-        nonlocal found
-        if found or depth > 6:
-            return
-        if isinstance(node, dict):
-            if "mikasaErrorCode" in node or "mikasa_error_code" in node:
-                result = node.get("result", node.get("Result", "missing"))
-                if result in (None, {}, []):
-                    found = True
-                    return
-            for value in node.values():
-                if isinstance(value, (dict, list)):
-                    walk(value, depth + 1)
-        elif isinstance(node, list):
-            for item in node[:20]:
-                walk(item, depth + 1)
-
-    walk(body, 0)
-    return found
+def is_dimension_label(label: str) -> bool:
+    text = " ".join((label or "").split())
+    if not text or len(text) > 8 or any(word in text for word in ("生成", "开启", "新建", "删除", "暂停")):
+        return False
+    return text in DIMENSION_LABELS
 
 
 def json_has_mall(body) -> bool:
@@ -141,23 +128,22 @@ def json_has_mall(body) -> bool:
     return walk(body, 0)
 
 
-def json_has_metrics(body) -> bool:
-    """推广花费才算报表已经到手。商品数据里的成交额不能让同步提前结束。"""
-    try:
-        text = json.dumps(body, ensure_ascii=False).lower()
-    except (TypeError, ValueError):
-        return False
-    return any(mark in text for mark in ("spend", "cost", "成交花费", "推广花费", "总花费", "花费", "消耗"))
-
-
 def bucket_has_metrics(bucket: list[dict]) -> bool:
     for item in bucket:
         kind = item.get("kind")
-        if kind in {"csv", "xlsx"}:
+        if kind in {"csv", "xlsx"} and item.get("promo", True):
             return True
-        if kind == "json" and item.get("promo") and json_has_metrics(item.get("body")) and not body_looks_like_mikasa(item.get("body")):
+        if kind == "json" and json_has_metrics(item.get("body")) and not body_auth_failed(item.get("body")):
             return True
     return False
+
+
+def bucket_has_creative(bucket: list[dict]) -> bool:
+    return any(item.get("kind") == "json" and json_has_creative_metrics(item.get("body")) for item in bucket)
+
+
+def bucket_auth_failed(bucket: list[dict]) -> bool:
+    return any(item.get("kind") == "json" and body_auth_failed(item.get("body")) for item in bucket)
 
 
 def on_sso_page(url: str) -> bool:
@@ -199,16 +185,47 @@ def _tree_has_key(node, wanted: set[str], depth: int = 0) -> bool:
     return False
 
 
-def guidance_note(bucket: list[dict], seen: list[dict]) -> str:
-    if bucket_has_metrics(bucket) or capture_has_sydney(bucket):
+def yingxiao_host(url: str) -> bool:
+    host = urlsplit(url or "").netloc.lower()
+    return host == "yingxiao.pinduoduo.com" or host.endswith(".yingxiao.pinduoduo.com")
+
+
+def promo_surface_url(url: str) -> bool:
+    """已经离开授权页、进入推广报表或营销域名。回到商家首页不算。"""
+    if not url or on_sso_page(url):
+        return False
+    if yingxiao_host(url):
+        return True
+    path = urlsplit(url).path or ""
+    return any(marker in path for marker in ("/goods/report/", "/goods/promotion/", "/mains/promotion", "/mains/account/"))
+
+
+def promo_session_ready(page_urls: list[str], cookie_domains: list[str]) -> bool:
+    if any(promo_surface_url(url) for url in page_urls):
+        return True
+    return any("yingxiao" in (domain or "").lower() for domain in cookie_domains)
+
+
+def redirect_target(url: str) -> str:
+    values = parse_qs(urlsplit(url or "").query).get("redirectUrl") or []
+    if not values:
         return ""
-    mikasa = any(item.get("kind") == "json" and body_looks_like_mikasa(item.get("body")) for item in bucket)
-    if mikasa:
-        return (
-            "已登录商家后台，但推广中心返回了空结果（mikasa）。"
-            "请在弹出的窗口里点「推广中心」或「商品推广」，看到花费后再点同步。"
-            "程序不会点「生成报表」。"
-        )
+    target = values[0]
+    if target.startswith("https://yingxiao.pinduoduo.com/"):
+        return target
+    host = urlsplit(target).hostname or ""
+    if host in {"127.0.0.1", "localhost"}:
+        return target
+    return ""
+
+
+def guidance_note(bucket: list[dict], seen: list[dict]) -> str:
+    if bucket_has_metrics(bucket):
+        return ""
+    if bucket_auth_failed(bucket):
+        return AUTH_FAILED_NOTE
+    if capture_has_sydney(bucket):
+        return ""
     if not any(item.get("promo") for item in seen):
         return (
             "已登录商家后台，但没有收到推广报表请求。"
@@ -245,8 +262,8 @@ class PlaywrightLiveDriver:
         report_urls: tuple[str, ...] | list[str] | None = None,
         headless: bool = False,
         channel: str | None = None,
-        sso_probe_seconds: float = 8,
-        sso_wait_seconds: float = 90,
+        sso_probe_seconds: float = 15,
+        sso_wait_seconds: float = 180,
     ):
         self.login_url = login_url or OFFICIAL_LOGIN_URL
         self.report_urls = list(report_urls or DEFAULT_REPORT_URLS)
@@ -428,13 +445,12 @@ class PlaywrightLiveDriver:
 
         context.on("response", on_response)
         for url in self.report_urls:
-            if bucket_has_metrics(bucket) and not _is_goods_effect(url):
-                continue
             if stuck and is_sso_entry(url):
                 continue
+            target = _resolve_entry(url, context)
             active = _latest_page(context, page)
             try:
-                active.goto(url, wait_until="domcontentloaded", timeout=20000)
+                active.goto(target, wait_until="domcontentloaded", timeout=20000)
             except Exception:
                 continue
             _settle(active)
@@ -449,38 +465,43 @@ class PlaywrightLiveDriver:
             if on_sso_page(active.url or ""):
                 left = _wait_off_sso(context, active, self.sso_probe_seconds)
                 active = _latest_page(context, active)
-                if not left:
+                if not left and not _has_yingxiao_cookie(context):
                     stuck = True
                     if not prompted:
                         prompted = True
                         if job is not None:
-                            job.update(message="推广中心停在授权页。请在弹出的窗口完成一次授权，不要关窗口。")
+                            job.update(
+                                message="推广中心未授权，页面停在登录跳转。请在弹出的窗口点一次「推广中心」，不要关窗口。"
+                            )
                         left = _wait_off_sso(context, active, self.sso_wait_seconds)
                         active = _latest_page(context, active)
-                    if not left and on_sso_page(active.url or ""):
-                        continue
-                _save_storage(context, db_path)
-                stuck = False
-            elif "yingxiao.pinduoduo.com" in (active.url or ""):
-                _save_storage(context, db_path)
-            if not bucket_has_metrics(bucket):
-                _click_exact(active, NAV_LABELS)
-                active = _latest_page(context, active)
-                _settle(active)
-                if "yingxiao.pinduoduo.com" in (active.url or "") and not on_sso_page(active.url or ""):
+                if left or _has_yingxiao_cookie(context) or promo_surface_url(active.url or ""):
                     _save_storage(context, db_path)
                     stuck = False
-            if not bucket_has_metrics(bucket):
-                _click_exact(active, DATE_LABELS)
-                active = _latest_page(context, active)
-                _settle(active)
-            _click_exports(active, bucket)
-        if stuck and not bucket_has_metrics(bucket):
-            bucket.append({"kind": "note", "body": SSO_STUCK_NOTE})
+                    direct = redirect_target(url)
+                    if direct and on_sso_page(_page_url(active)):
+                        try:
+                            active.goto(direct, wait_until="domcontentloaded", timeout=20000)
+                        except Exception:
+                            pass
+                        _settle(active)
+                        active = _latest_page(context, active)
+                        if promo_surface_url(_page_url(active)) or _has_yingxiao_cookie(context):
+                            _save_storage(context, db_path)
+                if stuck and on_sso_page(_page_url(active)):
+                    continue
+            elif promo_surface_url(_page_url(active)) or _has_yingxiao_cookie(context):
+                _save_storage(context, db_path)
+                stuck = False
+            active = _open_report_dimensions(context, active, bucket, db_path)
+            if promo_surface_url(_page_url(active)):
+                stuck = False
+        if not bucket_has_metrics(bucket) and (stuck or bucket_auth_failed(bucket)):
+            _append_note(bucket, AUTH_FAILED_NOTE)
         else:
             note = guidance_note(bucket, seen)
             if note:
-                bucket.append({"kind": "note", "body": note})
+                _append_note(bucket, note)
         return bucket, seen
 
 
@@ -530,18 +551,69 @@ def _save_storage(context, db_path: Path) -> None:
     tighten(path)
 
 
+def _json_chars(body) -> int:
+    try:
+        return len(json.dumps(body, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _essential_json(body) -> bool:
+    return bool(json_has_metrics(body) or body_auth_failed(body) or _tree_has_key(body, {"yesdata", "todaydata", "yeslist", "todaylist"}))
+
+
+def _identity_slice(body) -> dict | None:
+    found: dict[str, object] = {}
+
+    def walk(node, depth: int) -> None:
+        if depth > 6 or ("id" in found and "name" in found):
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if value in (None, ""):
+                    continue
+                norm = str(key).lower().replace("-", "_")
+                if norm in {"mall_id", "mallid"} and "id" not in found:
+                    found["id"] = value
+                elif norm in {"mall_name", "mallname"} and "name" not in found:
+                    found["name"] = value
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:20]:
+                walk(item, depth + 1)
+
+    walk(body, 0)
+    if not found:
+        return None
+    slim: dict[str, object] = {}
+    if "id" in found:
+        slim["mallId"] = found["id"]
+    if "name" in found:
+        slim["mallName"] = found["name"]
+    return slim
+
+
 def _save_capture(db_path: Path, captures: list[dict], seen: list[dict] | None = None) -> None:
     debug = {"kind": "debug", "urls": list(seen or [])[:_MAX_URLS]}
     preview = [debug]
     for item in captures:
         kind = item.get("kind")
         if kind == "json":
+            body = item.get("body")
+            if _json_chars(body) > _MAX_JSON_CHARS and not _essential_json(body):
+                body = _identity_slice(body)
+                if not body:
+                    continue
+            base, path = split_response_url(item.get("url") or "")
             preview.append(
                 {
                     "kind": "json",
-                    "url": item.get("url") or "",
-                    "path": item.get("path") or "",
-                    "body": item.get("body"),
+                    "url": base,
+                    "path": item.get("path") or path,
+                    "promo": bool(item.get("promo")),
+                    "body": body,
                 }
             )
         elif kind == "note":
@@ -549,12 +621,40 @@ def _save_capture(db_path: Path, captures: list[dict], seen: list[dict] | None =
         else:
             body = item.get("body")
             size = len(body) if isinstance(body, (bytes, bytearray)) else None
-            preview.append({"kind": kind, "url": item.get("url") or "", "bytes": size})
+            preview.append(
+                {
+                    "kind": kind,
+                    "url": item.get("url") or "",
+                    "path": item.get("path") or "",
+                    "promo": bool(item.get("promo", True)),
+                    "bytes": size,
+                }
+            )
     raw = json.dumps(preview, ensure_ascii=False, default=str)
     while len(raw) > 200_000 and len(preview) > 1:
-        preview.pop()
+        drop_at = _drop_index(preview)
+        preview.pop(drop_at)
         raw = json.dumps(preview, ensure_ascii=False, default=str)
     write_private_text(capture_path(db_path), raw)
+
+
+def _drop_index(preview: list[dict]) -> int:
+    """先丢掉又大又不是报表的正文。调试地址清单留在最前面。"""
+    best = 0
+    best_size = -1
+    for index, item in enumerate(preview):
+        if index == 0 or item.get("kind") == "note":
+            continue
+        body = item.get("body")
+        if item.get("kind") == "json" and _essential_json(body):
+            continue
+        size = _json_chars(body) if item.get("kind") == "json" else int(item.get("bytes") or 0)
+        if size >= best_size:
+            best = index
+            best_size = size
+    if best:
+        return best
+    return len(preview) - 1
 
 
 def _qr_image(page) -> str | None:
@@ -589,40 +689,99 @@ def _is_goods_effect(url: str) -> bool:
     return "goods_effect" in (url or "") or "goodsDataShow" in (url or "")
 
 
+def _page_url(page) -> str:
+    try:
+        return page.url or ""
+    except Exception:
+        return ""
+
+
+def _context_urls(context, page) -> list[str]:
+    urls = []
+    if page is not None:
+        urls.append(_page_url(page))
+    try:
+        pages = [item for item in context.pages if not item.is_closed()]
+    except Exception:
+        pages = []
+    for item in pages:
+        urls.append(_page_url(item))
+    return urls
+
+
+def _cookie_domains(context) -> list[str]:
+    try:
+        return [str(item.get("domain") or "") for item in context.cookies()]
+    except Exception:
+        return []
+
+
+def _has_yingxiao_cookie(context) -> bool:
+    return any("yingxiao" in domain.lower() for domain in _cookie_domains(context))
+
+
+def _resolve_entry(url: str, context) -> str:
+    if _has_yingxiao_cookie(context):
+        direct = redirect_target(url)
+        if direct:
+            return direct
+    return url
+
+
+def _append_note(bucket: list[dict], text: str) -> None:
+    if any(item.get("kind") == "note" and text in str(item.get("body") or "") for item in bucket):
+        return
+    bucket.append({"kind": "note", "body": text})
+
+
+def _open_report_dimensions(context, active, bucket: list[dict], db_path: Path):
+    """概况页不够。报表页上再点商品、创意、主图，并选一个已有日期。"""
+    if not bucket_has_metrics(bucket) and not promo_surface_url(_page_url(active)):
+        _click_exact(active, NAV_LABELS)
+        active = _latest_page(context, active)
+        _settle(active)
+        if promo_surface_url(_page_url(active)) or (yingxiao_host(_page_url(active)) and not on_sso_page(_page_url(active))):
+            _save_storage(context, db_path)
+    if promo_surface_url(_page_url(active)):
+        _save_storage(context, db_path)
+        if not bucket_has_creative(bucket):
+            _click_each(active, DIMENSION_LABELS)
+            active = _latest_page(context, active)
+            _settle(active)
+        if not bucket_has_metrics(bucket):
+            _click_exact(active, DATE_LABELS)
+            active = _latest_page(context, active)
+            _settle(active)
+    elif not bucket_has_metrics(bucket):
+        _click_exact(active, DATE_LABELS)
+        active = _latest_page(context, active)
+        _settle(active)
+    _click_exports(active, bucket)
+    return active
+
+
 def _wait_off_sso(context, page, seconds: float) -> bool:
     import time
 
-    def left() -> bool:
-        try:
-            current = page.url or ""
-        except Exception:
-            current = ""
-        if current and not on_sso_page(current):
-            return True
-        try:
-            pages = [item for item in context.pages if not item.is_closed()]
-        except Exception:
-            pages = []
-        for item in pages:
-            try:
-                current = item.url or ""
-            except Exception:
-                continue
-            if "yingxiao.pinduoduo.com" in current and not on_sso_page(current):
-                return True
-        return False
+    def ready() -> bool:
+        return promo_session_ready(_context_urls(context, page), _cookie_domains(context))
 
-    if left():
+    if ready():
         return True
     deadline = time.time() + max(0.0, seconds)
+    last_click = 0.0
     while time.time() < deadline:
+        now = time.time()
+        if on_sso_page(_page_url(page)) and now - last_click >= 1.5:
+            _click_label(page, "推广中心")
+            last_click = now
         try:
-            page.wait_for_timeout(200)
+            page.wait_for_timeout(400)
         except Exception:
-            return left()
-        if left():
+            return ready()
+        if ready():
             return True
-    return left()
+    return ready()
 
 
 def _stuck_on_login(url: str) -> bool:
@@ -653,30 +812,42 @@ def _settle(page) -> None:
 
 def _click_exact(page, labels: tuple[str, ...]) -> bool:
     for label in labels:
-        if not (is_promo_nav_label(label) or is_date_preset_label(label)):
-            continue
+        if _click_label(page, label):
+            return True
+    return False
+
+
+def _click_each(page, labels: tuple[str, ...]) -> None:
+    for label in labels:
+        if _click_label(page, label):
+            _settle(page)
+
+
+def _click_label(page, label: str) -> bool:
+    if not (is_promo_nav_label(label) or is_date_preset_label(label) or is_dimension_label(label)):
+        return False
+    try:
+        loc = page.get_by_text(label, exact=True)
+        count = min(loc.count(), 4)
+    except Exception:
+        return False
+    for index in range(count):
+        node = loc.nth(index)
         try:
-            loc = page.get_by_text(label, exact=True)
-            count = min(loc.count(), 4)
+            if not node.is_visible():
+                continue
+            node.click(timeout=1200, no_wait_after=True)
         except Exception:
             continue
-        for index in range(count):
-            node = loc.nth(index)
+        try:
+            popup = page.wait_for_event("popup", timeout=800)
             try:
-                if not node.is_visible():
-                    continue
-                node.click(timeout=1200, no_wait_after=True)
-            except Exception:
-                continue
-            try:
-                popup = page.wait_for_event("popup", timeout=1200)
-                try:
-                    popup.wait_for_load_state("domcontentloaded", timeout=8000)
-                except Exception:
-                    pass
+                popup.wait_for_load_state("domcontentloaded", timeout=8000)
             except Exception:
                 pass
-            return True
+        except Exception:
+            pass
+        return True
     return False
 
 
@@ -698,8 +869,23 @@ def _take_response(response, bucket: list[dict], seen: list[dict] | None = None)
             return
         if is_json:
             body = response.json()
-            item = {"kind": "json", "url": base, "path": path, "body": body, "promo": promo}
-            if promo:
+            essential = _essential_json(body)
+            item = {"kind": "json", "url": base, "path": path, "body": body, "promo": promo or essential}
+            if _json_chars(body) > _MAX_JSON_CHARS and not essential:
+                ident = _identity_slice(body)
+                if ident and not any(entry.get("role") == "identity" for entry in bucket):
+                    bucket.append(
+                        {
+                            "kind": "json",
+                            "url": base,
+                            "path": path,
+                            "body": ident,
+                            "promo": False,
+                            "role": "identity",
+                        }
+                    )
+                return
+            if promo or essential:
                 _remember_json(bucket, item)
             elif json_has_mall(body) and not any(entry.get("role") == "identity" for entry in bucket):
                 item["role"] = "identity"
@@ -722,9 +908,11 @@ def _remember_json(bucket: list[dict], item: dict) -> None:
     if len(json_items) <= _MAX_JSON:
         return
     for old in json_items:
-        if "yingxiao.pinduoduo.com" not in (old.get("url") or ""):
-            bucket.remove(old)
-            return
+        url = old.get("url") or ""
+        if "yingxiao.pinduoduo.com" in url or _essential_json(old.get("body")):
+            continue
+        bucket.remove(old)
+        return
     bucket.remove(json_items[0])
 
 
@@ -755,7 +943,8 @@ def _click_exports(page, bucket: list[dict]) -> None:
             name = (downloaded.value.suggested_filename or "").lower()
             kind = "xlsx" if name.endswith((".xlsx", ".xls")) else "csv"
             if len(data) <= 5_000_000:
-                bucket.append({"kind": kind, "body": data})
+                base, path = split_response_url(_page_url(page))
+                bucket.append({"kind": kind, "url": base, "path": path, "body": data, "promo": True})
             clicked += 1
         except Exception:
             continue

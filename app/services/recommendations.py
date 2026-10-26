@@ -537,6 +537,8 @@ def _aggregate_goods(conn, shop_id: str, start: date, end: date) -> list[dict]:
     )
     aggs = []
     for row in goods:
+        if row["category"] == "商品数据":
+            continue
         series = grouped.get(row["goods_id"], [])
         prior, recent = _sum_orders(series)
         aggs.append(
@@ -609,6 +611,8 @@ def _aggregate_campaigns(conn, shop_id: str, start: date, end: date) -> list[dic
     )
     aggs = []
     for row in campaigns:
+        if row["scene"] == "商品数据" or row["name"] == "商品数据":
+            continue
         series = grouped.get(row["campaign_id"], [])
         aggs.append(
             {

@@ -30,7 +30,7 @@ _auth_lock = threading.Lock()
 _auth_generation = 0
 _driver = None
 
-READING_MESSAGE = "已扫码，正在读取推广报表。请在弹出的窗口进入推广中心，先不要点「重新打开登录」。"
+READING_MESSAGE = "已扫码，正在读取推广报表。若窗口停在授权页，请点一次「推广中心」，不要关窗口，也不要先点「重新打开登录」。"
 
 
 class LoginJob:
@@ -365,6 +365,7 @@ def payload_from_saved_capture(db_path: str | Path):
                             "body": item["body"],
                             "url": item.get("url") or "",
                             "path": item.get("path") or "",
+                            "promo": bool(item.get("promo")),
                         }
                     )
                 elif item.get("kind") == "note" and item.get("body"):

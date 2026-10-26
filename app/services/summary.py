@@ -93,7 +93,19 @@ def _compose(name, day, today, current, previous, goods, images, generated_at) -
     if not risks:
         risks.append("没有触发花费、ROI 或转化的明显风险。")
 
-    narrative = _narrative(name, day, complete, current, previous, top, weak, best_image, worst_image)
+    shop_data_only = bool(goods) and not images and all(row.get("category") == "商品数据" for row in goods)
+    narrative = _narrative(
+        name,
+        day,
+        complete,
+        current,
+        previous,
+        top,
+        weak,
+        best_image,
+        worst_image,
+        shop_data_only=shop_data_only,
+    )
     return {
         "date": day.isoformat(),
         "shop_name": name,
@@ -111,7 +123,7 @@ def _compose(name, day, today, current, previous, goods, images, generated_at) -
     }
 
 
-def _narrative(name, day, complete, current, previous, top, weak, best_image, worst_image) -> str:
+def _narrative(name, day, complete, current, previous, top, weak, best_image, worst_image, shop_data_only: bool = False) -> str:
     head = pretty_day(day)
     if complete:
         opening = f"{head}，{name} 的推广复盘如下。"
@@ -128,6 +140,8 @@ def _narrative(name, day, complete, current, previous, top, weak, best_image, wo
         f"{spend_move}，{roi_move}。"
     )
     parts = [opening, body]
+    if shop_data_only:
+        parts.append("成交额和订单来自商家后台「商品数据」，不是推广测款，也没有测图。推广花费要等推广中心授权后再同步。")
     if top:
         best = top[0]
         parts.append(
