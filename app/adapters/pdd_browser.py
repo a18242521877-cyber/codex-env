@@ -26,21 +26,26 @@ from app.adapters.pdd_session import (
     tighten,
     write_private_text,
 )
-from app.config import OFFICIAL_LOGIN_URL, OFFICIAL_PROMO_URL
+from app.config import OFFICIAL_LOGIN_URL
 from app.errors import AppError
 
 LOGIN_COOKIE_NAMES = PASS_COOKIE_NAMES
 MMS_HOME_URL = "https://mms.pinduoduo.com/home/"
-YINGXIAO_ORIGIN = "https://yingxiao.pinduoduo.com"
-# 这些是推广中心页面，不是我们自己拼的数据接口。营销域名需要先走商家后台的登录跳转。
-YINGXIAO_PAGES = (
-    "/mains/account/report",
-    "/mains/goods/promotion",
-    "/goods/promotion/list",
-    "/",
+# 商家后台侧栏里的推广入口。直接打开营销域名会停在 /login/sso，要先等它跳走。
+SIDEBAR_TARGETS = (
+    "https://yingxiao.pinduoduo.com/mains/promotionOverview",
+    "https://yingxiao.pinduoduo.com/goods/promotion/list",
+    "https://yingxiao.pinduoduo.com/goods/report/promotion/overView",
+    "https://yingxiao.pinduoduo.com/mains/account/finance",
 )
-PROMO_URL_HINTS = ("report", "promotion", "/ad", "advertise", "creative", "campaign", "goods", "plan")
-NAV_LABELS = ("推广中心", "推广平台", "多多招财", "商品推广", "推广报表", "推广概况", "账户报表")
+GOODS_EFFECT_URL = "https://mms.pinduoduo.com/sycm/goods_effect/detail"
+PROMO_URL_HINTS = ("report", "promotion", "/ad", "advertise", "creative", "campaign", "goods", "plan", "goodsdatashow", "sydney")
+NAV_LABELS = ("推广概况", "推广中心", "推广平台", "多多招财", "商品推广", "推广报表", "推广账户", "账户报表")
+SSO_STUCK_NOTE = (
+    "推广中心授权没有完成，页面停在登录跳转。"
+    "请在弹出的窗口点一次「推广中心」并完成授权后再同步。"
+    "这次没有写入推广花费。"
+)
 DATE_LABELS = ("近7天", "近7日", "最近7天", "昨天", "近30天", "近30日")
 _MAX_JSON = 36
 _MAX_URLS = 80
@@ -53,12 +58,9 @@ def promo_sso_url(target: str) -> str:
 
 
 def default_report_urls() -> tuple[str, ...]:
-    pages = [MMS_HOME_URL, promo_sso_url(OFFICIAL_PROMO_URL)]
-    for path in YINGXIAO_PAGES:
-        target = YINGXIAO_ORIGIN + "/" if path == "/" else YINGXIAO_ORIGIN + path
-        entry = promo_sso_url(target)
-        if entry not in pages:
-            pages.append(entry)
+    pages = [MMS_HOME_URL, GOODS_EFFECT_URL]
+    for target in SIDEBAR_TARGETS:
+        pages.append(promo_sso_url(target))
     return tuple(pages)
 
 
@@ -140,11 +142,12 @@ def json_has_mall(body) -> bool:
 
 
 def json_has_metrics(body) -> bool:
+    """推广花费才算报表已经到手。商品数据里的成交额不能让同步提前结束。"""
     try:
         text = json.dumps(body, ensure_ascii=False).lower()
     except (TypeError, ValueError):
         return False
-    return any(mark in text for mark in ("spend", "goodsid", "creativeid", "ordernum", "impression", "成交花费", "花费", "曝光"))
+    return any(mark in text for mark in ("spend", "cost", "成交花费", "推广花费", "总花费", "花费", "消耗"))
 
 
 def bucket_has_metrics(bucket: list[dict]) -> bool:
@@ -157,8 +160,47 @@ def bucket_has_metrics(bucket: list[dict]) -> bool:
     return False
 
 
+def on_sso_page(url: str) -> bool:
+    path = urlsplit(url or "").path or ""
+    return path.rstrip("/").endswith("/login/sso")
+
+
+def is_sso_entry(url: str) -> bool:
+    parts = urlsplit(url or "")
+    if on_sso_page(url):
+        return True
+    return "platform=yingxiao" in (parts.query or "")
+
+
+def capture_has_sydney(bucket: list[dict]) -> bool:
+    for item in bucket:
+        if item.get("kind") != "json":
+            continue
+        url = (item.get("url") or "").lower()
+        if "goodsdatashow" in url or "/sydney/" in url:
+            return True
+        body = item.get("body")
+        if isinstance(body, dict) and _tree_has_key(body, {"yesdata", "todaydata", "yeslist", "todaylist"}):
+            return True
+    return False
+
+
+def _tree_has_key(node, wanted: set[str], depth: int = 0) -> bool:
+    if depth > 6:
+        return False
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key).lower() in wanted:
+                return True
+            if isinstance(value, (dict, list)) and _tree_has_key(value, wanted, depth + 1):
+                return True
+    elif isinstance(node, list):
+        return any(_tree_has_key(item, wanted, depth + 1) for item in node[:20])
+    return False
+
+
 def guidance_note(bucket: list[dict], seen: list[dict]) -> str:
-    if bucket_has_metrics(bucket):
+    if bucket_has_metrics(bucket) or capture_has_sydney(bucket):
         return ""
     mikasa = any(item.get("kind") == "json" and body_looks_like_mikasa(item.get("body")) for item in bucket)
     if mikasa:
@@ -196,11 +238,22 @@ def is_export_label(label: str) -> bool:
 
 
 class PlaywrightLiveDriver:
-    def __init__(self, *, login_url: str | None = None, report_urls: tuple[str, ...] | list[str] | None = None, headless: bool = False, channel: str | None = None):
+    def __init__(
+        self,
+        *,
+        login_url: str | None = None,
+        report_urls: tuple[str, ...] | list[str] | None = None,
+        headless: bool = False,
+        channel: str | None = None,
+        sso_probe_seconds: float = 8,
+        sso_wait_seconds: float = 90,
+    ):
         self.login_url = login_url or OFFICIAL_LOGIN_URL
         self.report_urls = list(report_urls or DEFAULT_REPORT_URLS)
         self.headless = headless
         self.channel = channel
+        self.sso_probe_seconds = sso_probe_seconds
+        self.sso_wait_seconds = sso_wait_seconds
 
     def check_ready(self) -> None:
         try:
@@ -274,7 +327,13 @@ class PlaywrightLiveDriver:
                         )
                     hint = _shop_name(page)
                     try:
-                        captures, seen = self._harvest(page, context, db_path, keep_session=job is not None)
+                        captures, seen = self._harvest(
+                            page,
+                            context,
+                            db_path,
+                            keep_session=job is not None,
+                            job=job,
+                        )
                     except AppError:
                         if job is not None:
                             from app.services.live_login import retain_saved_login
@@ -358,17 +417,21 @@ class PlaywrightLiveDriver:
         except Exception as exc:
             raise _browser_error(exc) from exc
 
-    def _harvest(self, page, context, db_path: Path, keep_session: bool = False):
+    def _harvest(self, page, context, db_path: Path, keep_session: bool = False, job=None):
         bucket: list[dict] = []
         seen: list[dict] = []
+        stuck = False
+        prompted = False
 
         def on_response(response) -> None:
             _take_response(response, bucket, seen)
 
         context.on("response", on_response)
         for url in self.report_urls:
-            if bucket_has_metrics(bucket):
-                break
+            if bucket_has_metrics(bucket) and not _is_goods_effect(url):
+                continue
+            if stuck and is_sso_entry(url):
+                continue
             active = _latest_page(context, page)
             try:
                 active.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -383,18 +446,41 @@ class PlaywrightLiveDriver:
 
                 drop_live_login(db_path)
                 raise AppError("登录已失效，请重新扫码", status=401, code="login_required")
+            if on_sso_page(active.url or ""):
+                left = _wait_off_sso(context, active, self.sso_probe_seconds)
+                active = _latest_page(context, active)
+                if not left:
+                    stuck = True
+                    if not prompted:
+                        prompted = True
+                        if job is not None:
+                            job.update(message="推广中心停在授权页。请在弹出的窗口完成一次授权，不要关窗口。")
+                        left = _wait_off_sso(context, active, self.sso_wait_seconds)
+                        active = _latest_page(context, active)
+                    if not left and on_sso_page(active.url or ""):
+                        continue
+                _save_storage(context, db_path)
+                stuck = False
+            elif "yingxiao.pinduoduo.com" in (active.url or ""):
+                _save_storage(context, db_path)
             if not bucket_has_metrics(bucket):
                 _click_exact(active, NAV_LABELS)
                 active = _latest_page(context, active)
                 _settle(active)
+                if "yingxiao.pinduoduo.com" in (active.url or "") and not on_sso_page(active.url or ""):
+                    _save_storage(context, db_path)
+                    stuck = False
             if not bucket_has_metrics(bucket):
                 _click_exact(active, DATE_LABELS)
                 active = _latest_page(context, active)
                 _settle(active)
             _click_exports(active, bucket)
-        note = guidance_note(bucket, seen)
-        if note:
-            bucket.append({"kind": "note", "body": note})
+        if stuck and not bucket_has_metrics(bucket):
+            bucket.append({"kind": "note", "body": SSO_STUCK_NOTE})
+        else:
+            note = guidance_note(bucket, seen)
+            if note:
+                bucket.append({"kind": "note", "body": note})
         return bucket, seen
 
 
@@ -497,6 +583,46 @@ def _shop_name(page) -> str:
         if text:
             return text[:40]
     return ""
+
+
+def _is_goods_effect(url: str) -> bool:
+    return "goods_effect" in (url or "") or "goodsDataShow" in (url or "")
+
+
+def _wait_off_sso(context, page, seconds: float) -> bool:
+    import time
+
+    def left() -> bool:
+        try:
+            current = page.url or ""
+        except Exception:
+            current = ""
+        if current and not on_sso_page(current):
+            return True
+        try:
+            pages = [item for item in context.pages if not item.is_closed()]
+        except Exception:
+            pages = []
+        for item in pages:
+            try:
+                current = item.url or ""
+            except Exception:
+                continue
+            if "yingxiao.pinduoduo.com" in current and not on_sso_page(current):
+                return True
+        return False
+
+    if left():
+        return True
+    deadline = time.time() + max(0.0, seconds)
+    while time.time() < deadline:
+        try:
+            page.wait_for_timeout(200)
+        except Exception:
+            return left()
+        if left():
+            return True
+    return left()
 
 
 def _stuck_on_login(url: str) -> bool:

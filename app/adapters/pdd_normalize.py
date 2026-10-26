@@ -19,7 +19,7 @@ import csv
 import io
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.adapters.base import (
@@ -52,6 +52,10 @@ _SCENE = ("scene", "推广场景", "推广类型", "场景", "计划类型")
 _STAGE = ("stage", "阶段")
 _MALL_ID = ("mallId", "mall_id", "shopId")
 _MALL_NAME = ("mallName", "mall_name", "shopName", "店铺名称", "店铺名")
+SYDNEY_SOURCE_NOTE = (
+    "昨日成交额和订单来自商家后台「商品数据」，不是推广花费。"
+    "推广花费需要在弹出的窗口完成一次「推广中心」授权后再同步。"
+)
 
 
 def money_to_fen(value: Any, *, source: str) -> int:
@@ -77,6 +81,90 @@ def money_to_fen(value: Any, *, source: str) -> int:
     return 0
 
 
+def _plaintext_metric(value: Any) -> bool:
+    if isinstance(value, bool) or value is None or value == "":
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    text = str(value).strip().replace(",", "").replace("元", "").replace("%", "")
+    return bool(re.fullmatch(r"-?\d+(\.\d+)?", text))
+
+
+def _sydney_item_row(item: dict, day: date, *, aggregate: bool) -> dict | None:
+    amount = item.get("payOrdrAmt")
+    orders = item.get("payOrdrCnt")
+    page_views = item.get("gpv")
+    if not any(_plaintext_metric(value) for value in (amount, orders, page_views)):
+        return None
+    if aggregate:
+        goods_id, name = "sydney-shop", "全店商品数据"
+    else:
+        goods_id = item.get("goodsId", item.get("goods_id"))
+        name = item.get("goodsName") or item.get("goods_name") or "商品"
+        if goods_id in (None, ""):
+            return None
+    row: dict[str, Any] = {
+        "goodsid": goods_id,
+        "goodsname": str(name)[:80],
+        "statdate": day.isoformat(),
+        "scene": "商品数据",
+        "__source": "json",
+    }
+    if _plaintext_metric(amount):
+        row["gmv"] = amount
+    if _plaintext_metric(orders):
+        row["ordernum"] = orders
+    if _plaintext_metric(page_views):
+        row["impression"] = page_views
+    return row
+
+
+def _sydney_blocks(node: Any, found: list[dict], depth: int = 0) -> None:
+    if depth > 8:
+        return
+    if isinstance(node, dict):
+        if any(key in node for key in ("yesData", "todayData", "yesList", "todayList")):
+            found.append(node)
+            return
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                _sydney_blocks(value, found, depth + 1)
+    elif isinstance(node, list):
+        for item in node[:20]:
+            _sydney_blocks(item, found, depth + 1)
+
+
+def extract_sydney_rows(data: Any, today: date) -> list[tuple[str, dict]]:
+    """商家后台商品数据。yesData 是昨天的明文成交额，不是推广花费。"""
+    blocks: list[dict] = []
+    _sydney_blocks(data, blocks)
+    rows: list[tuple[str, dict]] = []
+    yesterday = today - timedelta(days=1)
+    for block in blocks:
+        list_rows: list[tuple[str, dict]] = []
+        for key, day in (("yesList", yesterday), ("todayList", today)):
+            items = block.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                mapped = _sydney_item_row(item, day, aggregate=False)
+                if mapped:
+                    list_rows.append(("goods", mapped))
+        if list_rows:
+            rows.extend(list_rows)
+            continue
+        for key, day in (("yesData", yesterday), ("todayData", today)):
+            item = block.get(key)
+            if not isinstance(item, dict):
+                continue
+            mapped = _sydney_item_row(item, day, aggregate=True)
+            if mapped:
+                rows.append(("goods", mapped))
+    return rows
+
+
 def normalize_captures(
     captures: list[dict],
     *,
@@ -98,6 +186,11 @@ def normalize_captures(
             data = _load_json(body)
             if data is None:
                 continue
+            sydney_rows = extract_sydney_rows(data, today)
+            if sydney_rows:
+                rows.extend(sydney_rows)
+                if SYDNEY_SOURCE_NOTE not in notes:
+                    notes.append(SYDNEY_SOURCE_NOTE)
             _walk(data, rows, mall, "json")
         elif kind == "csv":
             text = _decode_table(body)

@@ -7,10 +7,14 @@ from urllib.parse import quote
 
 from app.adapters.pdd_browser import (
     DATE_LABELS,
+    GOODS_EFFECT_URL,
     MMS_HOME_URL,
+    SIDEBAR_TARGETS,
+    SSO_STUCK_NOTE,
     _take_response,
     body_looks_like_mikasa,
     bucket_has_metrics,
+    capture_has_sydney,
     default_report_urls,
     guidance_note,
     is_date_preset_label,
@@ -20,7 +24,6 @@ from app.adapters.pdd_browser import (
     split_response_url,
 )
 from app.adapters.pdd_normalize import normalize_captures
-from app.config import OFFICIAL_PROMO_URL
 import unittest
 
 
@@ -42,12 +45,19 @@ class HarvestSelectionTests(unittest.TestCase):
     def test_sso_entry_points_at_the_merchant_jump(self):
         urls = default_report_urls()
         self.assertEqual(urls[0], MMS_HOME_URL)
-        jump = promo_sso_url(OFFICIAL_PROMO_URL)
-        self.assertIn(jump, urls)
-        self.assertIn("accessType=auto", jump)
-        self.assertIn("platform=yingxiao", jump)
-        self.assertIn(quote(OFFICIAL_PROMO_URL, safe=""), jump)
-        self.assertTrue(jump.startswith("https://mms.pinduoduo.com/login/sso?"))
+        self.assertIn(GOODS_EFFECT_URL, urls)
+        for target in SIDEBAR_TARGETS:
+            jump = promo_sso_url(target)
+            self.assertIn(jump, urls)
+            self.assertIn("accessType=auto", jump)
+            self.assertIn("platform=yingxiao", jump)
+            self.assertIn(quote(target, safe=""), jump)
+            self.assertTrue(jump.startswith("https://mms.pinduoduo.com/login/sso?"))
+        joined = "".join(urls)
+        self.assertIn(quote("https://yingxiao.pinduoduo.com/mains/promotionOverview", safe=""), joined)
+        self.assertIn(quote("https://yingxiao.pinduoduo.com/goods/promotion/list", safe=""), joined)
+        self.assertIn(quote("https://yingxiao.pinduoduo.com/goods/report/promotion/overView", safe=""), joined)
+        self.assertIn(quote("https://yingxiao.pinduoduo.com/mains/account/finance", safe=""), joined)
 
     def test_labels_do_not_include_generate_report(self):
         self.assertTrue(is_promo_nav_label("商品推广"))
@@ -124,6 +134,109 @@ class HarvestSelectionTests(unittest.TestCase):
         self.assertEqual([item.name for item in payload.goods], ["渔获单品"])
         days = [day for rows in payload.goods_days.values() for day in rows]
         self.assertEqual(days[0].spend_fen, 350)
+
+    def test_sydney_yesdata_fills_yesterday_without_calling_it_promo_spend(self):
+        today = date(2026, 10, 26)
+        payload = normalize_captures(
+            [
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms",
+                    "path": "/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms",
+                    "body": {
+                        "success": True,
+                        "result": {
+                            "mallId": 753391861,
+                            "mallName": "御品渔获专营店",
+                            "yesData": {
+                                "payOrdrAmt": "5538.6",
+                                "payOrdrCnt": "122",
+                                "payUvRto": "6.23%",
+                                "gpv": "2722",
+                                "guv": "1953",
+                                "vstGoodsCnt": "7",
+                                "payOrdrUsrCnt": "122",
+                            },
+                            "todayData": {"payOrdrAmt": "12.5", "payOrdrCnt": "1", "gpv": "20"},
+                        },
+                    },
+                },
+                {"kind": "note", "body": SSO_STUCK_NOTE},
+            ],
+            shop_hint="御品渔获专营店",
+            today=today,
+        )
+        self.assertEqual(payload.shop.shop_id, "live-753391861")
+        self.assertEqual(len(payload.goods), 1)
+        self.assertEqual(payload.goods[0].name, "全店商品数据")
+        yesterday = payload.goods_days[payload.goods[0].goods_id][0]
+        self.assertEqual(yesterday.stat_date, "2026-10-25")
+        self.assertEqual(yesterday.gmv_fen, 553860)
+        self.assertEqual(yesterday.orders, 122)
+        self.assertEqual(yesterday.impressions, 2722)
+        self.assertEqual(yesterday.spend_fen, 0)
+        self.assertIn("商品数据", payload.note)
+        self.assertIn("推广花费", payload.note)
+        self.assertIn("授权", payload.note)
+        self.assertTrue(capture_has_sydney([{"kind": "json", "body": {"result": {"yesData": {}}}}]))
+        self.assertEqual(guidance_note([{"kind": "json", "body": {"result": {"yesData": {"payOrdrAmt": "1.0"}}}}], []), "")
+
+    def test_plaintext_yeslist_beats_obfuscated_glyphs_and_shop_total(self):
+        today = date(2026, 10, 26)
+        payload = normalize_captures(
+            [
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms",
+                    "body": {
+                        "result": {
+                            "yesData": {"payOrdrAmt": "5538.6", "payOrdrCnt": "122", "gpv": "2722"},
+                            "yesList": [
+                                {
+                                    "goodsId": 9001,
+                                    "goodsName": "渔获单品",
+                                    "payOrdrAmt": "10.5",
+                                    "payOrdrCnt": "2",
+                                    "gpv": "80",
+                                },
+                                {
+                                    "goodsId": 9002,
+                                    "goodsName": "乱码商品",
+                                    "payOrdrAmt": "\ue501\ue502",
+                                    "payOrdrCnt": "\ue503",
+                                    "gpv": "\ue504",
+                                },
+                            ],
+                        }
+                    },
+                }
+            ],
+            today=today,
+        )
+        self.assertEqual([item.name for item in payload.goods], ["渔获单品"])
+        day = payload.goods_days[payload.goods[0].goods_id][0]
+        self.assertEqual(day.gmv_fen, 1050)
+        self.assertEqual(day.orders, 2)
+        self.assertEqual(day.spend_fen, 0)
+        self.assertNotIn("5538.60", payload.note)
+
+    def test_sso_stuck_without_sydney_is_not_a_silent_empty_sync(self):
+        payload = normalize_captures(
+            [
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/home/",
+                    "body": {"mallId": 753391861, "mallName": "御品渔获专营店", "permissionList": [], "result": None},
+                },
+                {"kind": "note", "body": SSO_STUCK_NOTE},
+            ],
+            today=date(2026, 10, 26),
+        )
+        self.assertEqual(payload.goods, [])
+        self.assertEqual(payload.campaigns, [])
+        self.assertIn("授权", payload.note)
+        self.assertIn("没有写入推广花费", payload.note)
+        self.assertNotEqual(payload.note.strip(), "")
 
     def test_note_is_kept_when_resume_reads_capture(self):
         payload = normalize_captures(

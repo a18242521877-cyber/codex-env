@@ -75,6 +75,19 @@ GENERATED_JSON = """{
      "impression": 1, "click": 1, "spend": 1, "gmv": 1, "orderNum": 1}
   ]}
 }"""
+EFFECT_HTML = """<!doctype html><html><body>
+<div class="shop-name">夹具店铺</div>
+<script>fetch("/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms");</script>
+</body></html>"""
+SSO_HTML = """<!doctype html><html><body><p>推广中心授权</p></body></html>"""
+SYDNEY_JSON = """{
+  "success": true,
+  "result": {
+    "mallId": 753391861,
+    "mallName": "御品渔获专营店",
+    "yesData": {"payOrdrAmt": "5538.6", "payOrdrCnt": "122", "gpv": "2722", "payUvRto": "6.23%"}
+  }
+}"""
 REPORT_JSON = """{
   "mallId": 10001,
   "mallName": "夹具店铺",
@@ -111,6 +124,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/mms/profile.json": ("application/json", PROFILE_JSON.encode()),
             "/api/goods/promotion/list.json": ("application/json", PROMO_LIST_JSON.encode()),
             "/api/generated-report.json": ("application/json", GENERATED_JSON.encode()),
+            "/sycm/goods_effect/detail": ("text/html; charset=utf-8", EFFECT_HTML.encode()),
+            "/login/sso": ("text/html; charset=utf-8", SSO_HTML.encode()),
+            "/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms": ("application/json", SYDNEY_JSON.encode()),
         }
         if path not in routes:
             body = b"no"
@@ -241,6 +257,53 @@ class BrowserFixtureTests(unittest.TestCase):
             self.assertIn("/api/goods/promotion/list.json", raw)
             self.assertIn("/api/mms/profile.json", raw)
             self.assertNotIn("不应出现", raw)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_sso_stuck_still_keeps_yesterday_goods_effect(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        try:
+            init_db(conn)
+            now = now_local()
+            conn.execute(
+                "INSERT INTO login_tickets(ticket, mode, status, created_at, expires_at) VALUES(?, 'live', 'pending', ?, ?)",
+                ("sydney-ticket", iso(now), iso(now)),
+            )
+            conn.commit()
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            driver = PlaywrightLiveDriver(
+                login_url=base + "/login/",
+                report_urls=[base + "/sycm/goods_effect/detail", base + "/login/sso"],
+                headless=True,
+                sso_probe_seconds=0.4,
+                sso_wait_seconds=0,
+            )
+            job = LoginJob("sydney-ticket")
+            driver.run(job, db_path)
+            self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            row = conn.execute(
+                """
+                SELECT g.stat_date, g.spend_fen, g.gmv_fen, g.orders
+                FROM goods_daily g
+                JOIN sessions s ON s.shop_id = g.shop_id
+                """
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["spend_fen"], 0)
+            self.assertEqual(row["gmv_fen"], 553860)
+            self.assertEqual(row["orders"], 122)
+            details = " ".join(item["detail"] for item in conn.execute("SELECT detail FROM operation_logs"))
+            self.assertIn("商品数据", details)
+            self.assertIn("没有写入推广花费", details)
         finally:
             httpd.shutdown()
             httpd.server_close()
