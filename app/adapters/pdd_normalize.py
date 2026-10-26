@@ -89,6 +89,11 @@ def normalize_captures(
     for item in captures:
         kind = item.get("kind")
         body = item.get("body")
+        if kind == "note" and body:
+            notes.append(str(body).strip()[:300])
+            continue
+        if kind == "debug":
+            continue
         if kind == "json":
             data = _load_json(body)
             if data is None:

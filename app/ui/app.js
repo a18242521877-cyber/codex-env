@@ -209,7 +209,7 @@ async function startQr() {
       <h2>用商家版扫码登录</h2>
       <div class="qr-wrap" id="qr-slot"><img id="live-qr" alt="拼多多商家登录二维码" hidden /></div>
       <p class="small" id="login-status">${esc(data.hint || data.message || "")}</p>
-      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。验证码在那个窗口里完成。</p>
+      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。若窗口停在首页，点一次「推广中心」或「商品推广」。验证码在那个窗口里完成。</p>
       <div class="actions">
         <button class="btn ghost" type="button" data-act="refresh-qr">重新打开登录</button>
         ${data.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}

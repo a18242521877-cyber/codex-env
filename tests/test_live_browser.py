@@ -37,6 +37,44 @@ fetch("/api/report.json").then(function (r) { return r.json(); }).then(function 
 });
 </script>
 </body></html>"""
+MMS_HOME_HTML = """<!doctype html><html><body>
+<div class="shop-name">夹具店铺</div>
+<a href="/goods/promotion/report">商品推广</a>
+<script>fetch("/api/mms/profile.json");</script>
+</body></html>"""
+PROMO_PAGE_HTML = """<!doctype html><html><body>
+<button type="button" id="week">近7天</button>
+<button type="button" id="gen">生成报表</button>
+<script>
+document.getElementById("gen").onclick = function () { fetch("/api/generated-report.json"); };
+document.getElementById("week").onclick = function () {
+  fetch("/api/goods/promotion/list.json?access_token=should-not-store");
+};
+</script>
+</body></html>"""
+PROFILE_JSON = """{
+  "mall_id": 753391861,
+  "mall_name": "御品渔获专营店",
+  "permissionList": [],
+  "packList": [],
+  "mikasaErrorCode": 54001,
+  "result": null
+}"""
+PROMO_LIST_JSON = """{
+  "mallId": 753391861,
+  "mallName": "御品渔获专营店",
+  "result": {"list": [
+    {"statDate": "2026-10-24", "goodsId": 9001, "goodsName": "渔获单品",
+     "impression": 10, "click": 2, "spend": 3.5, "gmv": 8, "orderNum": 1}
+  ]}
+}"""
+GENERATED_JSON = """{
+  "mallId": 1,
+  "result": {"list": [
+    {"statDate": "2026-10-24", "goodsId": 1, "goodsName": "不应出现",
+     "impression": 1, "click": 1, "spend": 1, "gmv": 1, "orderNum": 1}
+  ]}
+}"""
 REPORT_JSON = """{
   "mallId": 10001,
   "mallName": "夹具店铺",
@@ -66,6 +104,13 @@ class Handler(BaseHTTPRequestHandler):
             "/report/": ("text/html; charset=utf-8", REPORT_HTML.encode()),
             "/api/report.json": ("application/json", REPORT_JSON.encode()),
             "/goods.csv": ("text/csv; charset=utf-8", CSV.encode("utf-8")),
+            "/mms/home": ("text/html; charset=utf-8", MMS_HOME_HTML.encode()),
+            "/mms/home/": ("text/html; charset=utf-8", MMS_HOME_HTML.encode()),
+            "/goods/promotion/report": ("text/html; charset=utf-8", PROMO_PAGE_HTML.encode()),
+            "/goods/promotion/report/": ("text/html; charset=utf-8", PROMO_PAGE_HTML.encode()),
+            "/api/mms/profile.json": ("application/json", PROFILE_JSON.encode()),
+            "/api/goods/promotion/list.json": ("application/json", PROMO_LIST_JSON.encode()),
+            "/api/generated-report.json": ("application/json", GENERATED_JSON.encode()),
         }
         if path not in routes:
             body = b"no"
@@ -143,6 +188,59 @@ class BrowserFixtureTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(extra)
             self.assertEqual(extra["spend_fen"], 1000)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_home_json_is_not_enough_until_promo_page_loads(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        try:
+            init_db(conn)
+            now = now_local()
+            conn.execute(
+                "INSERT INTO login_tickets(ticket, mode, status, created_at, expires_at) VALUES(?, 'live', 'pending', ?, ?)",
+                ("promo-ticket", iso(now), iso(now)),
+            )
+            conn.commit()
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            driver = PlaywrightLiveDriver(
+                login_url=base + "/login/",
+                report_urls=[base + "/mms/home/"],
+                headless=True,
+            )
+            job = LoginJob("promo-ticket")
+            driver.run(job, db_path)
+            self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            names = [row["name"] for row in conn.execute("SELECT name FROM goods")]
+            self.assertEqual(names, ["渔获单品"])
+            spend = conn.execute(
+                "SELECT spend_fen FROM goods_daily WHERE stat_date = '2026-10-24'"
+            ).fetchone()
+            self.assertEqual(spend["spend_fen"], 350)
+            shop = conn.execute(
+                """
+                SELECT shops.shop_id, shops.name
+                FROM sessions s
+                JOIN shops ON shops.shop_id = s.shop_id
+                """
+            ).fetchone()
+            self.assertEqual(shop["shop_id"], "live-753391861")
+            self.assertEqual(shop["name"], "御品渔获专营店")
+            from app.adapters.pdd_session import capture_path
+
+            raw = capture_path(db_path).read_text(encoding="utf-8")
+            self.assertNotIn("should-not-store", raw)
+            self.assertIn("/api/goods/promotion/list.json", raw)
+            self.assertIn("/api/mms/profile.json", raw)
+            self.assertNotIn("不应出现", raw)
         finally:
             httpd.shutdown()
             httpd.server_close()

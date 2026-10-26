@@ -30,7 +30,7 @@ _auth_lock = threading.Lock()
 _auth_generation = 0
 _driver = None
 
-READING_MESSAGE = "已扫码，正在读取推广报表。请只扫弹出的浏览器窗口，先不要点「重新打开登录」。"
+READING_MESSAGE = "已扫码，正在读取推广报表。请在弹出的窗口进入推广中心，先不要点「重新打开登录」。"
 
 
 class LoginJob:
@@ -356,8 +356,19 @@ def payload_from_saved_capture(db_path: str | Path):
             data = None
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and item.get("kind") == "json" and "body" in item:
-                    captures.append({"kind": "json", "body": item["body"]})
+                if not isinstance(item, dict):
+                    continue
+                if item.get("kind") == "json" and "body" in item:
+                    captures.append(
+                        {
+                            "kind": "json",
+                            "body": item["body"],
+                            "url": item.get("url") or "",
+                            "path": item.get("path") or "",
+                        }
+                    )
+                elif item.get("kind") == "note" and item.get("body"):
+                    captures.append({"kind": "note", "body": item["body"]})
     return normalize_captures(captures, shop_hint="拼多多店铺", today=date.today())
 
 
