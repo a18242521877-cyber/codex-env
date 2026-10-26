@@ -55,20 +55,25 @@ class ScriptedLiveDriver:
     def check_ready(self) -> None:
         return None
 
-    def run(self, job, db_path) -> None:
+    def run(self, job, db_path, **kwargs) -> None:
         if job.snapshot().get("cancelled") and not job.snapshot().get("cookies_saved"):
             return
         write_private_text(storage_state_path(db_path), '{"cookies":[],"origins":[]}\n')
         job.update(cookies_saved=True)
-        payload = scripted_payload()
+        from app.adapters.pdd_normalize import SAVED_LOGIN_NOTE, normalize_captures
         from app.services.live_login import finish_live_session, retain_saved_login
 
+        if kwargs.get("establish_session") is False:
+            job.update(status="confirmed", finished=True, cookies_saved=True, message=SAVED_LOGIN_NOTE)
+            return
+        payload = normalize_captures([], shop_hint="夹具真实店", today=date.today())
+        payload.note = SAVED_LOGIN_NOTE
         result = finish_live_session(db_path, payload, job.ticket, generation=getattr(job, "generation", None))
         if result.get("skipped"):
             return
         # 取消发生在写入之后也不能删会话。重新打开登录只停掉还没扫完的那一次。
         retain_saved_login(db_path, job)
-        job.update(status="confirmed", finished=True, cookies_saved=True, message=result["message"])
+        job.update(status="confirmed", finished=True, cookies_saved=True, message=SAVED_LOGIN_NOTE)
 
     def collect(self, db_path, *, today: date):
         return scripted_payload(today)

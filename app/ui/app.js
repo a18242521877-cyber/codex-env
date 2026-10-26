@@ -121,6 +121,25 @@ function stopPoll() {
   pollGen += 1;
 }
 
+function manualLogin(gate) {
+  return `请打开${gate}，在浏览器里自己完成登录，回到推广台后再点「同步」。同步只读取已保存的登录，不会代点，也不会等待扫码。`;
+}
+
+function loginGates() {
+  const gates = state.settings && state.settings.login_gates;
+  return Array.isArray(gates) && gates.length ? gates : [
+    { id: "mms", label: "商家后台", url: "https://mms.pinduoduo.com/login/" },
+    { id: "yingxiao", label: "推广中心", url: "https://yingxiao.pinduoduo.com/mains/promotionOverview" },
+  ];
+}
+
+function gateButtons(withLinks) {
+  return loginGates().map((gate) => `
+    <button class="btn" type="button" data-act="open-gate" data-gate="${esc(gate.id)}">打开${esc(gate.label)}</button>
+    ${withLinks ? `<a class="btn ghost" href="${esc(gate.url)}" target="_blank" rel="noreferrer">${esc(gate.label)}地址</a>` : ""}
+  `).join("");
+}
+
 async function boot() {
   stopPoll();
   try {
@@ -132,7 +151,8 @@ async function boot() {
   if (!state.session.logged_in) {
     state.settings = await api("/api/settings");
     renderLogin();
-    startQr();
+    if (state.settings.values.data_mode === "mock") startQr();
+    else renderLiveGates();
     return;
   }
   const info = await api("/api/bootstrap");
@@ -159,7 +179,7 @@ function renderLogin() {
           <div><strong>推广台</strong><span>拼多多店铺</span></div>
         </div>
         <h1>看清推广、测图和测款，当天就能决定怎么调。</h1>
-        <p class="lead">扫码进入店铺后，查看花费、成交和 ROI，并生成每日总结与调整方案。数据留在这台电脑上。</p>
+        <p class="lead">打开登录页并自己完成后，点「同步」查看花费、成交和 ROI，再生成每日总结与调整方案。数据留在这台电脑上。</p>
         <div class="points">
           <div><strong>测图</strong><span class="muted"> 比较主图点击率和转化率，样本够了再建议换图。</span></div>
           <div><strong>测款</strong><span class="muted"> 按近 7 个完整日判断放量、暂停，或先改详情。</span></div>
@@ -204,17 +224,9 @@ async function startQr() {
   }
   state.ticket = data.ticket;
   if (data.mode === "live") {
-    panel.innerHTML = `
-      ${switcher}
-      <h2>用商家版扫码登录</h2>
-      <div class="qr-wrap" id="qr-slot"><img id="live-qr" alt="拼多多商家登录二维码" hidden /></div>
-      <p class="small" id="login-status">${esc(data.hint || data.message || "")}</p>
-      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。若窗口停在授权页或结果写着「登录态为空」，在那个窗口点一次「推广中心」，不要关窗口。验证码在那个窗口里完成。</p>
-      <div class="actions">
-        <button class="btn ghost" type="button" data-act="refresh-qr">重新打开登录</button>
-        ${data.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
-        <a class="btn" href="${esc(data.official_login_url)}" target="_blank" rel="noreferrer">登录页地址</a>
-      </div>`;
+    panel.innerHTML = liveGateMarkup(switcher, data.message || data.hint || "");
+    const status = document.getElementById("login-status");
+    if (status) status.textContent = data.message || data.hint || "";
     poll(gen, data.ticket);
     return;
   }
@@ -229,6 +241,30 @@ async function startQr() {
   const slot = document.getElementById("qr-slot");
   if (slot) slot.innerHTML = data.qr_svg;
   poll(gen, data.ticket);
+}
+
+function liveGateMarkup(switcher, message) {
+  return `
+    ${switcher}
+    <h2>自己完成登录</h2>
+    <p class="small" id="login-status">${esc(message || "先打开要登录的页面。在弹出的浏览器里自己完成登录，回到这里再点「同步」。")}</p>
+    <p class="small muted">${esc(manualLogin("商家后台、推广中心或其他登录页"))} 头像若返回「Token不合法」，那是登录失败，不是成功。营销域名上只有 _nano_fp 也不算登录。</p>
+    <div class="actions">
+      ${gateButtons(true)}
+      ${state.session && state.session.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
+    </div>`;
+}
+
+function renderLiveGates() {
+  const panel = document.getElementById("login-panel");
+  if (!panel) return;
+  const mode = state.settings.values.data_mode;
+  const switcher = `
+    <div class="mode-switch">
+      <button class="btn ${mode === "mock" ? "primary" : ""}" data-act="mode" data-mode="mock" type="button">模拟店铺</button>
+      <button class="btn ${mode === "live" ? "primary" : ""}" data-act="mode" data-mode="live" type="button">真实店铺</button>
+    </div>`;
+  panel.innerHTML = liveGateMarkup(switcher, "");
 }
 
 async function poll(gen, ticket) {
@@ -305,6 +341,7 @@ function renderShell() {
             <input id="stat-date" type="date" value="${esc(state.date)}" ${min} ${max} />
             <button class="btn" type="button" data-act="yesterday">昨天</button>
             <button class="btn" type="button" data-act="sync" ${state.syncing ? "disabled" : ""}>同步</button>
+            ${state.session.mode === "live" ? gateButtons(false) : ""}
             <button class="btn ghost" type="button" data-act="logout">退出</button>
           </div>
         </header>
@@ -452,10 +489,12 @@ function renderImages(items) {
     const live = state.session && state.session.mode === "live";
     const last = (state.lastSync && state.lastSync.message) || "";
     let text = "没有测图。";
-    if (live && (last.includes("登录态为空") || last.includes("未授权") || last.includes("测图测款未写入"))) {
-      text = "推广中心未授权 / 登录态为空，测图未写入。请在弹出的窗口点一次「推广中心」完成授权后再同步。";
+    if (live && last.includes("Token不合法")) {
+      text = "头像登录失败：Token不合法，测图未写入。不要只点头像。" + manualLogin("推广中心页面");
+    } else if (live && (last.includes("登录态为空") || last.includes("尚未登录") || last.includes("测图测款未写入"))) {
+      text = "推广中心尚未登录，测图未写入。" + manualLogin("推广中心页面");
     } else if (live) {
-      text = "测图需要推广报表里的创意或主图。若窗口停在授权页，点一次「推广中心」，不要关窗口。";
+      text = "测图需要推广报表里的创意或主图。" + manualLogin("推广报表页面");
     }
     return `<p class="empty">${text}</p>`;
   }
@@ -474,10 +513,13 @@ function renderImages(items) {
 function renderGoods(items) {
   if (!items.length) return `<p class="empty">没有测款。</p>`;
   const shopData = items.filter((row) => row.category === "商品数据");
+  const homeSpend = shopData.some((row) => row.name === "首页推广花费");
   const banner = shopData.length && shopData.length === items.length
-    ? `<p class="banner">这些成交来自商家后台「商品数据」，不是推广测款。测款要等推广报表里的商品维度同步成功。</p>`
+    ? (homeSpend
+      ? `<p class="banner">首页上的推广花费已写入。这是首页汇总，不是测款或测图。${esc(manualLogin("推广中心页面"))}</p>`
+      : `<p class="banner">这些成交来自商家后台「商品数据」，不是推广测款。${esc(manualLogin("推广中心页面"))}</p>`)
     : shopData.length
-      ? `<p class="banner">标成「商品数据」的是全店成交兜底，不计入推广测款。</p>`
+      ? `<p class="banner">标成「商品数据」的是全店成交或首页花费兜底，不计入推广测款。</p>`
       : "";
   return `${banner}<div class="cards">${items.map((row) => `
     <article class="goods-card">
@@ -650,9 +692,17 @@ async function onClick(event) {
     } else if (act === "mode") {
       state.settings = await api("/api/settings", { method: "PUT", body: { data_mode: node.dataset.mode } });
       renderLogin();
-      startQr();
+      if (node.dataset.mode === "mock") startQr();
+      else renderLiveGates();
     } else if (act === "refresh-qr" || act === "resume-login") {
       startQr();
+    } else if (act === "open-gate") {
+      const opened = await api("/api/auth/open", { method: "POST", body: { gate: node.dataset.gate } });
+      state.ticket = opened.ticket;
+      const status = document.getElementById("login-status");
+      if (status) status.textContent = opened.message || opened.hint || "";
+      else toast(opened.message || "已打开登录页");
+      if (opened.ticket) poll(++pollGen, opened.ticket);
     } else if (act === "confirm") {
       node.disabled = true;
       await api(`/api/auth/qr/${encodeURIComponent(state.ticket)}/confirm`, { method: "POST", body: {} });

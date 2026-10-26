@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from app.config import SETTING_FIELDS
+from app.config import LOGIN_GATES, SETTING_FIELDS
 from app.db import load_setting_map, log_op, save_setting_map
 from app.errors import AppError
 
@@ -69,7 +69,7 @@ def load_settings(conn: sqlite3.Connection) -> Settings:
 
 def settings_payload(conn: sqlite3.Connection) -> dict:
     values = load_setting_map(conn)
-    return {"values": values, "fields": SETTING_FIELDS}
+    return {"values": values, "fields": SETTING_FIELDS, "login_gates": list(LOGIN_GATES)}
 
 
 def _normalize(field: dict, raw) -> str:

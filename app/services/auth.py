@@ -31,7 +31,13 @@ def public_session(conn: sqlite3.Connection, now: datetime | None = None) -> dic
         """
     ).fetchone()
     if row is None:
-        return {"logged_in": False}
+        from app.adapters.pdd_session import storage_state_is_logged_in, storage_state_path
+        from app.db import database_path
+
+        return {
+            "logged_in": False,
+            "resume_available": storage_state_is_logged_in(storage_state_path(database_path(conn))),
+        }
     return {
         "logged_in": True,
         "mode": row["mode"],
@@ -48,7 +54,7 @@ def public_session(conn: sqlite3.Connection, now: datetime | None = None) -> dic
 def require_session(conn: sqlite3.Connection, now: datetime | None = None) -> dict:
     session = public_session(conn, now)
     if not session["logged_in"]:
-        raise AuthError("请先扫码登录")
+        raise AuthError("商家后台尚未登录。请打开商家后台登录页，在浏览器里自己完成登录，回到推广台后再点「同步」。")
     return session
 
 

@@ -212,6 +212,12 @@ def run_self_test() -> int:
         )
         storage = db_path.parent / "pdd-session" / "storage_state.json"
         check("会话文件只留在本机数据库旁边", storage.is_file() and "cookie" not in session)
+        status, synced = request("POST", "/api/sync", {})
+        check(
+            "登录后点同步才读取报表",
+            status == 200 and "夹具真实店" in str(synced.get("message", "")) and "测款" in str(synced.get("message", "")),
+            str(synced)[:240],
+        )
         yesterday = (date.today() - timedelta(days=1)).isoformat()
         status, summary = request("GET", f"/api/summary?date={yesterday}")
         narrative = summary.get("narrative", "") if isinstance(summary, dict) else ""

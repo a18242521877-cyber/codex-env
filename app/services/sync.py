@@ -25,6 +25,8 @@ def sync_account(conn: sqlite3.Connection, *, mode: str, now: datetime | None = 
     try:
         payload = get_adapter(mode, database_path(conn)).fetch(today=now.date(), now=now)
         counts = persist_payload(conn, payload, synced_at=iso(now_local()))
+        conn.execute("UPDATE sessions SET shop_id = ? WHERE id = 1", (payload.shop.shop_id,))
+        conn.commit()
         message = describe_sync(payload, counts)
         finish_run(conn, run_id, payload.shop.shop_id, "success", message)
         log_op(conn, "同步", message)
@@ -59,6 +61,16 @@ def _shop_data_campaign(campaign) -> bool:
     return campaign.scene == "商品数据" or campaign.name == "商品数据"
 
 
+def _shop_data_trade(payload: SyncPayload) -> bool:
+    for item in payload.goods:
+        if not _shop_data_goods(item):
+            continue
+        for day in payload.goods_days.get(item.goods_id, []):
+            if day.gmv_fen or day.orders:
+                return True
+    return False
+
+
 def describe_sync(payload: SyncPayload, counts: dict) -> str:
     """测款、测图只数推广报表。商品数据兜底和授权失败都不能写成「已同步，测款 0」。"""
     from app.adapters.pdd_normalize import note_says_auth_failed
@@ -68,9 +80,11 @@ def describe_sync(payload: SyncPayload, counts: dict) -> str:
     images = list(payload.images)
     note = (payload.note or "").strip()
     sydney = any(_shop_data_goods(item) for item in payload.goods)
+    if "登录已保存" in note and not goods and not images:
+        return f"{payload.shop.name}：{note}"
     if note_says_auth_failed(note) and not goods and not images:
         message = f"{payload.shop.name}：{note}" if note else f"{payload.shop.name}：推广中心未授权 / 登录态为空，测图测款未写入"
-        if sydney and "不是推广测款" not in message:
+        if _shop_data_trade(payload) and "不是推广测款" not in message:
             message += " 昨日成交来自商品数据，不是推广测款。"
         return message
     message = (

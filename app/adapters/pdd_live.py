@@ -11,10 +11,11 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.adapters.base import SyncPayload
+from app.adapters.pdd_normalize import MMS_LOGIN_NOTE
 from app.adapters.pdd_session import storage_state_path
 from app.errors import AppError
 
-_SCAN = "请先扫码登录真实店铺。打开登录页后，用拼多多商家版扫描二维码。"
+_SCAN = MMS_LOGIN_NOTE
 
 
 class PddLiveAdapter:

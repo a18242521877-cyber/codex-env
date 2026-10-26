@@ -52,16 +52,48 @@ _SCENE = ("scene", "推广场景", "推广类型", "场景", "计划类型")
 _STAGE = ("stage", "阶段")
 _MALL_ID = ("mallId", "mall_id", "shopId")
 _MALL_NAME = ("mallName", "mall_name", "shopName", "店铺名称", "店铺名")
+def manual_login_tail(gate: str) -> str:
+    """商家后台、推广中心和其他登录页都用同一句下一步。"""
+    return (
+        f"请打开{gate}，在浏览器里自己完成登录，回到推广台后再点「同步」。"
+        "同步只读取已保存的登录，不会代点，也不会等待扫码。"
+    )
+
+
 SYDNEY_SOURCE_NOTE = (
     "昨日成交额和订单来自商家后台「商品数据」，不是推广花费。"
-    "推广花费需要在弹出的窗口完成一次「推广中心」授权后再同步。"
+    "推广花费需要打开推广中心页面，自己完成登录后再点「同步」。"
 )
 AUTH_FAILED_NOTE = (
-    "推广中心未授权 / 登录态为空，测图测款未写入。"
-    "请在弹出的窗口点一次「推广中心」并完成授权，不要关窗口。"
-    "授权完成后会写回推广中心登录态，再同步一次才会写入测款和测图。"
-    "这次没有写入推广花费。"
+    "推广中心尚未登录（登录态为空），测图测款未写入。"
+    + manual_login_tail("推广中心页面")
+    + "这次没有写入推广花费。"
 )
+TOKEN_INVALID_NOTE = (
+    "推广中心头像登录失败：Token不合法，测图测款未写入。不要只点头像。"
+    + manual_login_tail("推广中心页面")
+)
+MMS_LOGIN_NOTE = "商家后台尚未登录。" + manual_login_tail("商家后台登录页")
+SAVED_LOGIN_NOTE = (
+    "登录已保存。请回到推广台，点「同步」读取报表。"
+    "同步只读取已保存的登录，不会代点，也不会等待扫码。"
+)
+HOME_SPEND_NOTE = (
+    "商家后台首页上的推广花费已写入。这是首页汇总，不是测款或测图。测图测款未写入。"
+    + manual_login_tail("推广中心页面")
+)
+_HOME_SPEND_KEYS = {
+    "adspend",
+    "adcost",
+    "adspendamt",
+    "promotioncost",
+    "promotionspend",
+    "promospend",
+    "spendamt",
+    "costamt",
+    "推广花费",
+    "广告花费",
+}
 _METRIC_KEY_NORMS = {
     "spend",
     "cost",
@@ -182,9 +214,33 @@ def body_looks_like_mikasa(body: Any) -> bool:
     return found
 
 
+def body_token_invalid(body: Any) -> bool:
+    """头像换票失败。generateAccessToken 返回 Token不合法时，推广中心并没有登录。"""
+    found = False
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal found
+        if found or depth > 8:
+            return
+        if isinstance(node, dict):
+            message = node.get("errorMsg", node.get("error_msg", node.get("errorMessage")))
+            if isinstance(message, str) and "Token不合法" in message:
+                found = True
+                return
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:30]:
+                walk(item, depth + 1)
+
+    walk(body, 0)
+    return found
+
+
 def body_auth_failed(body: Any) -> bool:
-    """登录态为空或 mikasa 空结果。这是授权失败，不是报表里没有商品。"""
-    if body_looks_like_mikasa(body):
+    """登录态为空、头像 Token不合法，或 mikasa 空结果。这是授权失败，不是报表里没有商品。"""
+    if body_looks_like_mikasa(body) or body_token_invalid(body):
         return True
     found = False
 
@@ -212,7 +268,7 @@ def note_says_auth_failed(note: str) -> bool:
     text = note or ""
     return any(
         mark in text
-        for mark in ("测图测款未写入", "登录态为空", "没有写入推广花费", "未授权", "授权没有完成")
+        for mark in ("测图测款未写入", "登录态为空", "没有写入推广花费", "未授权", "授权没有完成", "Token不合法")
     )
 
 
@@ -292,6 +348,108 @@ def _sydney_blocks(node: Any, found: list[dict], depth: int = 0) -> None:
             _sydney_blocks(item, found, depth + 1)
 
 
+def _home_spend_value(item: dict) -> Any:
+    for key, value in item.items():
+        if _key_norm(key) in _HOME_SPEND_KEYS and _plaintext_metric(value):
+            return value
+    return None
+
+
+def _home_spend_row(amount: Any, day: date, *, source: str) -> tuple[str, dict] | None:
+    if not _plaintext_metric(amount):
+        return None
+    return (
+        "goods",
+        {
+            "goodsid": "home-promo-spend",
+            "goodsname": "首页推广花费",
+            "statdate": day.isoformat(),
+            "scene": "商品数据",
+            "spend": amount,
+            "__source": source,
+        },
+    )
+
+
+def parse_home_promo_spend_text(text: str) -> tuple[str | None, str | None]:
+    """首页可见文案。推广花费旁边的今日、昨日金额按元，不当成测款。"""
+    compact = re.sub(r"\s+", " ", text or "")
+    amount = r"((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{1,2})?)(?![\d.])(?!%)"
+    today_amount = None
+    yesterday_amount = None
+    for match in re.finditer("推广花费", compact):
+        window = compact[max(0, match.start() - 80) : match.end() + 180]
+        today = re.search(r"(?:今日|今天)[^\d%]{0,16}" + amount, window)
+        yesterday = re.search(r"(?:昨日|昨天)[^\d%]{0,16}" + amount, window)
+        if today:
+            today_amount = today.group(1).replace(",", "")
+        if yesterday:
+            yesterday_amount = yesterday.group(1).replace(",", "")
+        if today_amount or yesterday_amount:
+            return today_amount, yesterday_amount
+    return None, None
+
+
+def extract_home_spend_rows(data: Any, today: date) -> list[tuple[str, dict]]:
+    """首页汇总里的推广花费。没有商品或创意身份，不能写成测款、测图。"""
+    rows: list[tuple[str, dict]] = []
+    yesterday = today - timedelta(days=1)
+    seen: set[str] = set()
+
+    def add(amount: Any, day: date, source: str) -> None:
+        mapped = _home_spend_row(amount, day, source=source)
+        if mapped is None:
+            return
+        stat = mapped[1]["statdate"]
+        if stat in seen:
+            return
+        seen.add(stat)
+        rows.append(mapped)
+
+    def walk(node: Any, depth: int) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            source = "ui" if node.get("source") == "mms-home-ui" else "json"
+            if "todayPromoSpend" in node or "yesPromoSpend" in node:
+                add(node.get("todayPromoSpend"), today, source)
+                add(node.get("yesPromoSpend"), yesterday, source)
+            for key, day in (("todayData", today), ("yesData", yesterday), ("today", today), ("yesterday", yesterday)):
+                block = node.get(key)
+                if isinstance(block, dict):
+                    amount = _home_spend_value(block)
+                    if amount is not None:
+                        add(amount, day, "json")
+            label = ""
+            for key in ("title", "name", "cardName", "label", "indexName", "quotaName"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    label = value
+                    break
+            if label.strip() == "推广花费":
+                today_raw = None
+                yesterday_raw = None
+                for key in ("todayValue", "today", "curValue", "value"):
+                    if _plaintext_metric(node.get(key)):
+                        today_raw = node.get(key)
+                        break
+                for key in ("yesterdayValue", "yesterday", "yesValue", "compareValue"):
+                    if _plaintext_metric(node.get(key)):
+                        yesterday_raw = node.get(key)
+                        break
+                add(today_raw, today, "json")
+                add(yesterday_raw, yesterday, "json")
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node[:30]:
+                walk(item, depth + 1)
+
+    walk(data, 0)
+    return rows
+
+
 def extract_sydney_rows(data: Any, today: date) -> list[tuple[str, dict]]:
     """商家后台商品数据。yesData 是昨天的明文成交额，不是推广花费。"""
     blocks: list[dict] = []
@@ -333,7 +491,9 @@ def normalize_captures(
     mall = {"id": "", "name": ""}
     notes: list[str] = []
     auth_failed = False
+    token_invalid = False
     promo_metrics = False
+    pending_home: list[tuple[str, dict]] = []
     for item in captures:
         kind = item.get("kind")
         body = item.get("body")
@@ -349,7 +509,10 @@ def normalize_captures(
             data = _load_json(body)
             if data is None:
                 continue
-            if body_auth_failed(data):
+            if body_token_invalid(data):
+                token_invalid = True
+                auth_failed = True
+            elif body_auth_failed(data):
                 auth_failed = True
             if json_has_metrics(data) and not body_auth_failed(data):
                 promo_metrics = True
@@ -358,6 +521,7 @@ def normalize_captures(
                 rows.extend(sydney_rows)
                 if SYDNEY_SOURCE_NOTE not in notes:
                     notes.append(SYDNEY_SOURCE_NOTE)
+            pending_home.extend(extract_home_spend_rows(data, today))
             _walk(data, rows, mall, "json")
         elif kind == "csv":
             text = _decode_table(body)
@@ -383,8 +547,20 @@ def normalize_captures(
                 if row_kind and _has_metric(mapped):
                     rows.append((row_kind, {**mapped, "__source": "xlsx"}))
                     promo_metrics = True
+    home_spend = False
+    if pending_home and not promo_metrics:
+        rows.extend(pending_home)
+        home_spend = True
+        if HOME_SPEND_NOTE not in notes:
+            notes.append(HOME_SPEND_NOTE)
     if auth_failed and not promo_metrics and not any(note_says_auth_failed(item) for item in notes):
-        notes.append(AUTH_FAILED_NOTE)
+        notes.append(TOKEN_INVALID_NOTE if token_invalid else AUTH_FAILED_NOTE)
+    if token_invalid and not promo_metrics:
+        notes = [TOKEN_INVALID_NOTE if note == AUTH_FAILED_NOTE else note for note in notes]
+        if not any("Token不合法" in item for item in notes):
+            notes.insert(0, TOKEN_INVALID_NOTE)
+    if home_spend:
+        notes = [item.replace("这次没有写入推广花费。", "首页推广花费已另行写入，但测图测款仍未写入。") for item in notes]
     return _assemble(rows, mall, shop_hint=shop_hint, today=today, notes=notes)
 
 
@@ -629,11 +805,11 @@ def _assemble(
     shop_id = f"live-{_slug(mall_id)}" if mall_id else "live-unknown"
     name = (mall["name"] or shop_hint or "拼多多店铺")[:40]
     note = " ".join(notes)
-    if not goods_meta and not plan_meta and not note_says_auth_failed(note):
+    if not goods_meta and not plan_meta and not note_says_auth_failed(note) and "登录已保存" not in note:
         extra = (
             "已登录，但没有从报表里识别到推广商品或计划。"
-            "请在弹出的窗口打开推广报表，或下载已经生成好的报表后再同步。"
-            "测图只有报表带创意或主图时才会出现。"
+            + manual_login_tail("推广中心页面")
+            + "测图只有报表带创意或主图时才会出现。"
         )
         note = f"{note} {extra}".strip()
 

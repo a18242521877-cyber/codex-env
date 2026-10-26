@@ -18,11 +18,17 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 from app.adapters.pdd_normalize import (
     AUTH_FAILED_NOTE,
+    MMS_LOGIN_NOTE,
+    SAVED_LOGIN_NOTE,
+    TOKEN_INVALID_NOTE,
     body_auth_failed,
     body_looks_like_mikasa,
+    body_token_invalid,
     json_has_creative_metrics,
     json_has_metrics,
+    manual_login_tail,
     normalize_captures,
+    parse_home_promo_spend_text,
 )
 from app.adapters.pdd_session import (
     PASS_COOKIE_NAMES,
@@ -48,6 +54,8 @@ SIDEBAR_TARGETS = (
 GOODS_EFFECT_URL = "https://mms.pinduoduo.com/sycm/goods_effect/detail"
 PROMO_URL_HINTS = ("report", "promotion", "/ad", "advertise", "creative", "campaign", "plan", "goodsdatashow", "sydney")
 NAV_LABELS = ("推广概况", "推广中心", "推广平台", "多多招财", "商品推广", "推广报表", "推广账户", "账户报表")
+# 同步不代点登录入口。这些是已经进到报表后的页签。
+REPORT_NAV = ("推广概况", "商品推广", "推广报表", "推广账户", "账户报表")
 DIMENSION_LABELS = ("商品", "创意", "主图", "推广商品")
 SSO_STUCK_NOTE = AUTH_FAILED_NOTE
 DATE_LABELS = ("近7天", "近7日", "最近7天", "昨天", "近30天", "近30日")
@@ -63,10 +71,8 @@ def promo_sso_url(target: str) -> str:
 
 
 def default_report_urls() -> tuple[str, ...]:
-    pages = [MMS_HOME_URL, GOODS_EFFECT_URL]
-    for target in SIDEBAR_TARGETS:
-        pages.append(promo_sso_url(target))
-    return tuple(pages)
+    """同步直接打开固定页面。不走 accessType=auto，也不代点头像。"""
+    return (MMS_HOME_URL, GOODS_EFFECT_URL, *SIDEBAR_TARGETS)
 
 
 DEFAULT_REPORT_URLS = default_report_urls()
@@ -146,6 +152,15 @@ def bucket_auth_failed(bucket: list[dict]) -> bool:
     return any(item.get("kind") == "json" and body_auth_failed(item.get("body")) for item in bucket)
 
 
+def bucket_token_invalid(bucket: list[dict]) -> bool:
+    return any(item.get("kind") == "json" and body_token_invalid(item.get("body")) for item in bucket)
+
+
+def _auth_blocks_promo(bucket: list[dict]) -> bool:
+    """头像换票失败且没有报表时，营销域名和 _nano_fp 都不能当成授权成功。"""
+    return bucket_token_invalid(bucket) and not bucket_has_metrics(bucket)
+
+
 def on_sso_page(url: str) -> bool:
     path = urlsplit(url or "").path or ""
     return path.rstrip("/").endswith("/login/sso")
@@ -200,10 +215,27 @@ def promo_surface_url(url: str) -> bool:
     return any(marker in path for marker in ("/goods/report/", "/goods/promotion/", "/mains/promotion", "/mains/account/"))
 
 
-def promo_session_ready(page_urls: list[str], cookie_domains: list[str]) -> bool:
+def yingxiao_session_ready(cookies: list[dict] | None) -> bool:
+    """营销域名上的 _nano_fp 只是指纹，不是推广中心登录态。"""
+    for item in cookies or []:
+        if not isinstance(item, dict):
+            continue
+        domain = str(item.get("domain") or "").lower()
+        name = str(item.get("name") or "")
+        if "yingxiao" not in domain:
+            continue
+        if name in {"_nano_fp", "api_uid"} or name.startswith("_"):
+            continue
+        folded = name.upper()
+        if name in {"PASS_ID", "SUB_PASS_ID"} or "PASS" in folded or "TOKEN" in folded:
+            return True
+    return False
+
+
+def promo_session_ready(page_urls: list[str], cookies: list[dict] | None = None) -> bool:
     if any(promo_surface_url(url) for url in page_urls):
         return True
-    return any("yingxiao" in (domain or "").lower() for domain in cookie_domains)
+    return yingxiao_session_ready(cookies)
 
 
 def redirect_target(url: str) -> str:
@@ -222,18 +254,18 @@ def redirect_target(url: str) -> str:
 def guidance_note(bucket: list[dict], seen: list[dict]) -> str:
     if bucket_has_metrics(bucket):
         return ""
+    if bucket_token_invalid(bucket):
+        return TOKEN_INVALID_NOTE
     if bucket_auth_failed(bucket):
         return AUTH_FAILED_NOTE
     if capture_has_sydney(bucket):
         return ""
     if not any(item.get("promo") for item in seen):
-        return (
-            "已登录商家后台，但没有收到推广报表请求。"
-            "请在弹出的窗口从首页进入「推广中心」，停留在能看到花费的页面后再同步。"
-        )
+        return "已登录商家后台，但没有收到推广报表请求。" + manual_login_tail("推广中心页面")
     return (
         "已打开推广页面，但没有识别到花费、商品或创意。"
-        "请在弹出的窗口把日期选到有数据的范围后再同步。程序不会点「生成报表」。"
+        + manual_login_tail("推广报表页面")
+        + "程序不会点「生成报表」。"
     )
 
 
@@ -283,15 +315,35 @@ class PlaywrightLiveDriver:
                 code="browser_missing",
             ) from exc
 
-    def run(self, job, db_path) -> None:
+    def run(self, job, db_path, *, open_url: str | None = None, establish_session: bool = True) -> None:
         from app.config import LIVE_LOGIN_SECONDS
 
-        self._browse(db_path, job=job, today=date.today(), wait_seconds=LIVE_LOGIN_SECONDS, restore=False)
+        self._browse(
+            db_path,
+            job=job,
+            today=date.today(),
+            wait_seconds=LIVE_LOGIN_SECONDS,
+            restore=False,
+            harvest=False,
+            open_url=open_url or self.login_url,
+            establish_session=establish_session,
+        )
 
     def collect(self, db_path, *, today: date):
-        return self._browse(db_path, job=None, today=today, wait_seconds=0, restore=True)
+        return self._browse(db_path, job=None, today=today, wait_seconds=0, restore=True, harvest=True)
 
-    def _browse(self, db_path, *, job, today: date, wait_seconds: int, restore: bool):
+    def _browse(
+        self,
+        db_path,
+        *,
+        job,
+        today: date,
+        wait_seconds: int,
+        restore: bool,
+        harvest: bool = True,
+        open_url: str | None = None,
+        establish_session: bool = True,
+    ):
         from playwright.sync_api import sync_playwright
 
         db_path = Path(db_path)
@@ -314,20 +366,22 @@ class PlaywrightLiveDriver:
                             from app.services.live_login import drop_live_login
 
                             drop_live_login(db_path)
-                            raise AppError("登录已失效，请重新扫码", status=401, code="login_required")
+                            raise AppError(MMS_LOGIN_NOTE, status=401, code="login_required")
                     else:
-                        if not self._wait_for_scan(page, job, db_path, wait_seconds):
+                        if not self._wait_for_scan(page, job, db_path, wait_seconds, open_url or self.login_url):
                             return None
                         if _cancelled(job) and not job.snapshot().get("cookies_saved"):
                             return None
                         _save_storage(context, db_path)
-                        from app.services.live_login import READING_MESSAGE, finish_live_session
+                        from app.services.live_login import finish_live_session
 
                         hint = _shop_name(page)
-                        job.update(cookies_saved=True, message=READING_MESSAGE)
+                        job.update(cookies_saved=True, message=SAVED_LOGIN_NOTE)
+                        if not establish_session:
+                            job.update(status="confirmed", finished=True, cookies_saved=True, message=SAVED_LOGIN_NOTE)
+                            return None
                         provisional = normalize_captures([], shop_hint=hint or "拼多多店铺", today=today)
-                        if not provisional.note:
-                            provisional.note = "已登录。报表还在读取，进入店铺后等十几秒再刷新页面。"
+                        provisional.note = SAVED_LOGIN_NOTE
                         result = finish_live_session(
                             db_path,
                             provisional,
@@ -340,8 +394,11 @@ class PlaywrightLiveDriver:
                             status="confirmed",
                             finished=True,
                             cookies_saved=True,
-                            message=result.get("message") or READING_MESSAGE,
+                            message=SAVED_LOGIN_NOTE,
                         )
+                        return None
+                    if not harvest:
+                        return None
                     hint = _shop_name(page)
                     try:
                         captures, seen = self._harvest(
@@ -391,11 +448,11 @@ class PlaywrightLiveDriver:
                 pass
         return playwright.chromium.launch(headless=self.headless)
 
-    def _wait_for_scan(self, page, job, db_path: Path, wait_seconds: int) -> bool:
+    def _wait_for_scan(self, page, job, db_path: Path, wait_seconds: int, open_url: str) -> bool:
         import time
 
         try:
-            page.goto(self.login_url, wait_until="domcontentloaded", timeout=20000)
+            page.goto(open_url, wait_until="domcontentloaded", timeout=20000)
         except Exception as exc:
             raise _browser_error(exc) from exc
         def _on_frame(frame) -> None:
@@ -411,11 +468,9 @@ class PlaywrightLiveDriver:
                 return False
             image = _qr_image(page)
             if image:
-                job.update(qr_image=image, message="请用拼多多商家版 App 扫描弹出窗口里的二维码")
-            if _logged_in(page.context, page):
-                from app.services.live_login import READING_MESSAGE
-
-                job.update(message=READING_MESSAGE)
+                job.update(qr_image=image, message="请在弹出的浏览器里自己完成登录，然后回到推广台点「同步」。")
+            if _logged_in(page.context, page) or _has_yingxiao_session(page.context):
+                job.update(message=SAVED_LOGIN_NOTE)
                 return True
             try:
                 page.wait_for_url(lambda url: "/login" not in (url or ""), timeout=400)
@@ -424,7 +479,7 @@ class PlaywrightLiveDriver:
         from app.services.live_login import mark_ticket
 
         mark_ticket(db_path, job.ticket, "expired")
-        job.update(status="expired", message="扫码等待超时，请重新打开登录")
+        job.update(status="expired", message="登录等待超时。请重新打开登录页，在浏览器里自己完成登录后再点「同步」。")
         return False
 
     def _open_first(self, page) -> None:
@@ -438,66 +493,52 @@ class PlaywrightLiveDriver:
         bucket: list[dict] = []
         seen: list[dict] = []
         stuck = False
-        prompted = False
+        stuck_gate = ""
 
         def on_response(response) -> None:
             _take_response(response, bucket, seen)
 
         context.on("response", on_response)
         for url in self.report_urls:
-            if stuck and is_sso_entry(url):
+            if stuck and (is_sso_entry(url) or yingxiao_host(url)):
                 continue
-            target = _resolve_entry(url, context)
             active = _latest_page(context, page)
             try:
-                active.goto(target, wait_until="domcontentloaded", timeout=20000)
+                active.goto(url, wait_until="domcontentloaded", timeout=20000)
             except Exception:
                 continue
             _settle(active)
             active = _latest_page(context, active)
-            if _stuck_on_login(active.url or "") and not _has_login_cookie(context):
+            _capture_home_spend(active, bucket)
+            gate = _auth_gate_label(_page_url(active))
+            if gate == "商家后台" and not _has_login_cookie(context):
                 if keep_session:
                     return bucket, seen
                 from app.services.live_login import drop_live_login
 
                 drop_live_login(db_path)
-                raise AppError("登录已失效，请重新扫码", status=401, code="login_required")
-            if on_sso_page(active.url or ""):
-                left = _wait_off_sso(context, active, self.sso_probe_seconds)
-                active = _latest_page(context, active)
-                if not left and not _has_yingxiao_cookie(context):
-                    stuck = True
-                    if not prompted:
-                        prompted = True
-                        if job is not None:
-                            job.update(
-                                message="推广中心未授权，页面停在登录跳转。请在弹出的窗口点一次「推广中心」，不要关窗口。"
-                            )
-                        left = _wait_off_sso(context, active, self.sso_wait_seconds)
-                        active = _latest_page(context, active)
-                if left or _has_yingxiao_cookie(context) or promo_surface_url(active.url or ""):
-                    _save_storage(context, db_path)
-                    stuck = False
-                    direct = redirect_target(url)
-                    if direct and on_sso_page(_page_url(active)):
-                        try:
-                            active.goto(direct, wait_until="domcontentloaded", timeout=20000)
-                        except Exception:
-                            pass
-                        _settle(active)
-                        active = _latest_page(context, active)
-                        if promo_surface_url(_page_url(active)) or _has_yingxiao_cookie(context):
-                            _save_storage(context, db_path)
-                if stuck and on_sso_page(_page_url(active)):
-                    continue
-            elif promo_surface_url(_page_url(active)) or _has_yingxiao_cookie(context):
+                raise AppError(MMS_LOGIN_NOTE, status=401, code="login_required")
+            if gate:
+                stuck = True
+                stuck_gate = gate
+                continue
+            if (promo_surface_url(_page_url(active)) or _has_yingxiao_session(context)) and not _auth_blocks_promo(bucket):
                 _save_storage(context, db_path)
                 stuck = False
             active = _open_report_dimensions(context, active, bucket, db_path)
-            if promo_surface_url(_page_url(active)):
+            if _auth_gate_label(_page_url(active)):
+                stuck = True
+                stuck_gate = _auth_gate_label(_page_url(active))
+                continue
+            if promo_surface_url(_page_url(active)) and not _auth_blocks_promo(bucket):
                 stuck = False
-        if not bucket_has_metrics(bucket) and (stuck or bucket_auth_failed(bucket)):
-            _append_note(bucket, AUTH_FAILED_NOTE)
+        if not bucket_has_metrics(bucket) and (stuck or bucket_auth_failed(bucket) or bucket_token_invalid(bucket)):
+            if bucket_token_invalid(bucket):
+                _append_note(bucket, TOKEN_INVALID_NOTE)
+            elif stuck_gate == "商家后台":
+                _append_note(bucket, MMS_LOGIN_NOTE)
+            else:
+                _append_note(bucket, AUTH_FAILED_NOTE)
         else:
             note = guidance_note(bucket, seen)
             if note:
@@ -709,23 +750,42 @@ def _context_urls(context, page) -> list[str]:
     return urls
 
 
-def _cookie_domains(context) -> list[str]:
+def _cookie_records(context) -> list[dict]:
     try:
-        return [str(item.get("domain") or "") for item in context.cookies()]
+        return list(context.cookies())
     except Exception:
         return []
 
 
-def _has_yingxiao_cookie(context) -> bool:
-    return any("yingxiao" in domain.lower() for domain in _cookie_domains(context))
+def _has_yingxiao_session(context) -> bool:
+    return yingxiao_session_ready(_cookie_records(context))
 
 
-def _resolve_entry(url: str, context) -> str:
-    if _has_yingxiao_cookie(context):
-        direct = redirect_target(url)
-        if direct:
-            return direct
-    return url
+def _capture_home_spend(page, bucket: list[dict]) -> None:
+    if promo_surface_url(_page_url(page)) or on_sso_page(_page_url(page)):
+        return
+    try:
+        text = page.inner_text("body", timeout=1000)
+    except Exception:
+        return
+    today_amount, yesterday_amount = parse_home_promo_spend_text(text or "")
+    if not today_amount and not yesterday_amount:
+        return
+    base, path = split_response_url(_page_url(page))
+    bucket.append(
+        {
+            "kind": "json",
+            "url": base,
+            "path": path,
+            "promo": False,
+            "role": "home-spend",
+            "body": {
+                "source": "mms-home-ui",
+                "todayPromoSpend": today_amount,
+                "yesPromoSpend": yesterday_amount,
+            },
+        }
+    )
 
 
 def _append_note(bucket: list[dict], text: str) -> None:
@@ -734,10 +794,22 @@ def _append_note(bucket: list[dict], text: str) -> None:
     bucket.append({"kind": "note", "body": text})
 
 
+def _auth_gate_label(url: str) -> str:
+    """当前页是登录门时返回要打开的页面名。同步见到它就停，不代点。"""
+    if on_sso_page(url) or (yingxiao_host(url) and "/login" in (url or "")):
+        return "推广中心"
+    path = urlsplit(url or "").path or ""
+    if "/login" in path:
+        return "商家后台"
+    return ""
+
+
 def _open_report_dimensions(context, active, bucket: list[dict], db_path: Path):
-    """概况页不够。报表页上再点商品、创意、主图，并选一个已有日期。"""
+    """概况页不够。报表页上再点商品、创意、主图，并选一个已有日期。登录页不点。"""
+    if _auth_gate_label(_page_url(active)):
+        return active
     if not bucket_has_metrics(bucket) and not promo_surface_url(_page_url(active)):
-        _click_exact(active, NAV_LABELS)
+        _click_exact(active, REPORT_NAV)
         active = _latest_page(context, active)
         _settle(active)
         if promo_surface_url(_page_url(active)) or (yingxiao_host(_page_url(active)) and not on_sso_page(_page_url(active))):
@@ -758,38 +830,6 @@ def _open_report_dimensions(context, active, bucket: list[dict], db_path: Path):
         _settle(active)
     _click_exports(active, bucket)
     return active
-
-
-def _wait_off_sso(context, page, seconds: float) -> bool:
-    import time
-
-    def ready() -> bool:
-        return promo_session_ready(_context_urls(context, page), _cookie_domains(context))
-
-    if ready():
-        return True
-    deadline = time.time() + max(0.0, seconds)
-    last_click = 0.0
-    while time.time() < deadline:
-        now = time.time()
-        if on_sso_page(_page_url(page)) and now - last_click >= 1.5:
-            _click_label(page, "推广中心")
-            last_click = now
-        try:
-            page.wait_for_timeout(400)
-        except Exception:
-            return ready()
-        if ready():
-            return True
-    return ready()
-
-
-def _stuck_on_login(url: str) -> bool:
-    path = urlsplit(url or "").path or ""
-    # /login/sso 是跳进推广中心的中转，不是扫码页。
-    if path.rstrip("/").endswith("/login/sso"):
-        return False
-    return "/login" in path
 
 
 def _latest_page(context, fallback):

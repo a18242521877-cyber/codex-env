@@ -103,7 +103,8 @@ class RuleTests(unittest.TestCase):
         adapter = PddLiveAdapter(Path(self.tmp.name) / "rules.sqlite")
         with self.assertRaises(AppError) as caught:
             adapter.fetch(today=self.now.date(), now=self.now)
-        self.assertIn("扫码", str(caught.exception))
+        self.assertIn("同步", str(caught.exception))
+        self.assertIn("商家后台", str(caught.exception))
 
     def test_pace_classifier(self):
         settings = load_settings(self.conn)

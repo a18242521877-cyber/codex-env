@@ -32,7 +32,12 @@ from app.adapters.pdd_browser import (
     redirect_target,
     split_response_url,
 )
-from app.adapters.pdd_normalize import json_has_metrics, normalize_captures
+from app.adapters.pdd_normalize import (
+    body_token_invalid,
+    json_has_metrics,
+    normalize_captures,
+    parse_home_promo_spend_text,
+)
 from app.adapters.pdd_session import capture_path
 from app.services.sync import describe_sync
 import unittest
@@ -53,22 +58,19 @@ class _Response:
 
 
 class HarvestSelectionTests(unittest.TestCase):
-    def test_sso_entry_points_at_the_merchant_jump(self):
+    def test_sync_opens_fixed_targets_without_sso_automation(self):
         urls = default_report_urls()
         self.assertEqual(urls[0], MMS_HOME_URL)
         self.assertIn(GOODS_EFFECT_URL, urls)
         for target in SIDEBAR_TARGETS:
-            jump = promo_sso_url(target)
-            self.assertIn(jump, urls)
-            self.assertIn("accessType=auto", jump)
-            self.assertIn("platform=yingxiao", jump)
-            self.assertIn(quote(target, safe=""), jump)
-            self.assertTrue(jump.startswith("https://mms.pinduoduo.com/login/sso?"))
+            self.assertIn(target, urls)
         joined = "".join(urls)
-        self.assertIn(quote("https://yingxiao.pinduoduo.com/mains/promotionOverview", safe=""), joined)
-        self.assertIn(quote("https://yingxiao.pinduoduo.com/goods/promotion/list", safe=""), joined)
-        self.assertIn(quote("https://yingxiao.pinduoduo.com/goods/report/promotion/overView", safe=""), joined)
-        self.assertIn(quote("https://yingxiao.pinduoduo.com/mains/account/finance", safe=""), joined)
+        self.assertNotIn("accessType=auto", joined)
+        self.assertNotIn("/login/sso", joined)
+        jump = promo_sso_url(SIDEBAR_TARGETS[1])
+        self.assertIn("accessType=auto", jump)
+        self.assertIn(quote(SIDEBAR_TARGETS[1], safe=""), jump)
+        self.assertNotIn(jump, urls)
 
     def test_labels_do_not_include_generate_report(self):
         self.assertTrue(is_promo_nav_label("商品推广"))
@@ -195,7 +197,7 @@ class HarvestSelectionTests(unittest.TestCase):
         self.assertEqual(yesterday.spend_fen, 0)
         self.assertIn("商品数据", payload.note)
         self.assertIn("推广花费", payload.note)
-        self.assertIn("授权", payload.note)
+        self.assertIn("自己完成登录", payload.note)
         self.assertTrue(capture_has_sydney([{"kind": "json", "body": {"result": {"yesData": {}}}}]))
         self.assertEqual(guidance_note([{"kind": "json", "body": {"result": {"yesData": {"payOrdrAmt": "1.0"}}}}], []), "")
 
@@ -252,7 +254,7 @@ class HarvestSelectionTests(unittest.TestCase):
         )
         self.assertEqual(payload.goods, [])
         self.assertEqual(payload.campaigns, [])
-        self.assertIn("授权", payload.note)
+        self.assertIn("自己完成登录", payload.note)
         self.assertIn("没有写入推广花费", payload.note)
         self.assertIn("测图测款未写入", payload.note)
         self.assertNotIn("没有从报表里识别到", payload.note)
@@ -418,11 +420,149 @@ class HarvestSelectionTests(unittest.TestCase):
         home = "https://mms.pinduoduo.com/home/"
         sso = "https://mms.pinduoduo.com/login/sso?platform=yingxiao"
         report = "https://yingxiao.pinduoduo.com/goods/report/promotion/overView"
-        self.assertFalse(promo_session_ready([home], [".pinduoduo.com", "mms.pinduoduo.com"]))
-        self.assertFalse(promo_session_ready([sso], [".pinduoduo.com"]))
+        self.assertFalse(promo_session_ready([home], [{"name": "PASS_ID", "domain": ".pinduoduo.com"}]))
+        self.assertFalse(promo_session_ready([sso], [{"name": "PASS_ID", "domain": "mms.pinduoduo.com"}]))
+        self.assertFalse(promo_session_ready([sso], [".yingxiao.pinduoduo.com"]))
+        self.assertFalse(
+            promo_session_ready([sso], [{"name": "_nano_fp", "domain": ".yingxiao.pinduoduo.com"}])
+        )
+        self.assertFalse(
+            promo_session_ready([sso], [{"name": "api_uid", "domain": ".yingxiao.pinduoduo.com"}])
+        )
+        self.assertTrue(
+            promo_session_ready([sso], [{"name": "SUB_PASS_ID", "domain": ".yingxiao.pinduoduo.com"}])
+        )
         self.assertTrue(promo_session_ready([report], []))
-        self.assertTrue(promo_session_ready([sso], [".yingxiao.pinduoduo.com"]))
         self.assertTrue(promo_session_ready(["http://127.0.0.1:9/goods/report/promotion/overView"], []))
         self.assertFalse(promo_session_ready(["http://127.0.0.1:9/home/"], []))
         target = redirect_target(promo_sso_url("https://yingxiao.pinduoduo.com/goods/promotion/list"))
         self.assertEqual(target, "https://yingxiao.pinduoduo.com/goods/promotion/list")
+
+    def test_avatar_token_invalid_records_home_spend_without_creative_rows(self):
+        today = date(2026, 10, 26)
+        token = {"success": False, "errorCode": 2, "errorMsg": "Token不合法"}
+        self.assertTrue(body_token_invalid(token))
+        self.assertFalse(json_has_metrics(token))
+        self.assertEqual(
+            parse_home_promo_spend_text("推广花费 今日 220.15 昨日 386.40"),
+            ("220.15", "386.40"),
+        )
+        self.assertEqual(
+            parse_home_promo_spend_text("今日 推广花费 1,220.15 昨日 推广花费 386.40"),
+            ("1220.15", "386.40"),
+        )
+        self.assertEqual(parse_home_promo_spend_text("推广花费 今日 12.5% 昨日 386"), (None, "386"))
+        payload = normalize_captures(
+            [
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/janus/api/subSystem/generateAccessToken",
+                    "path": "/janus/api/subSystem/generateAccessToken",
+                    "promo": False,
+                    "body": token,
+                },
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/home/",
+                    "path": "/home/",
+                    "promo": False,
+                    "body": {
+                        "source": "mms-home-ui",
+                        "mallName": "港珠汇富专卖店",
+                        "todayPromoSpend": "220.15",
+                        "yesPromoSpend": "386.40",
+                    },
+                },
+                {
+                    "kind": "json",
+                    "url": "https://mms.pinduoduo.com/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms",
+                    "path": "/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms",
+                    "body": {
+                        "result": {
+                            "mallId": 753391861,
+                            "mallName": "港珠汇富专卖店",
+                            "todayData": {"adSpendAmt": "220.15"},
+                            "yesData": {"payOrdrAmt": "5538.6", "payOrdrCnt": "122", "gpv": "10"},
+                        }
+                    },
+                },
+            ],
+            shop_hint="港珠汇富专卖店",
+            today=today,
+        )
+        names = [item.name for item in payload.goods]
+        self.assertIn("首页推广花费", names)
+        self.assertIn("全店商品数据", names)
+        self.assertEqual(payload.images, [])
+        home = next(item for item in payload.goods if item.name == "首页推广花费")
+        spend = {day.stat_date: day.spend_fen for day in payload.goods_days[home.goods_id]}
+        self.assertEqual(spend["2026-10-26"], 22015)
+        self.assertEqual(spend["2026-10-25"], 38640)
+        sydney = next(item for item in payload.goods if item.name == "全店商品数据")
+        self.assertEqual(payload.goods_days[sydney.goods_id][0].spend_fen, 0)
+        self.assertIn("Token不合法", payload.note)
+        self.assertIn("首页", payload.note)
+        self.assertNotIn("这次没有写入推广花费", payload.note)
+        message = describe_sync(payload, {"campaigns": 1, "goods": 2, "images": 0, "days": 2})
+        self.assertNotIn("已同步", message)
+        self.assertNotIn("测款 1", message)
+        self.assertNotIn("测图 1", message)
+        self.assertIn("测图测款未写入", message)
+
+    def test_creative_report_wins_over_avatar_token_error(self):
+        payload = normalize_captures(
+            [
+                {
+                    "kind": "json",
+                    "body": {"success": False, "errorCode": 2, "errorMsg": "Token不合法"},
+                },
+                {
+                    "kind": "json",
+                    "body": {"source": "mms-home-ui", "todayPromoSpend": "220.15", "yesPromoSpend": "386.40"},
+                },
+                {
+                    "kind": "json",
+                    "url": "https://yingxiao.pinduoduo.com/goods/report/promotion/overView",
+                    "path": "/goods/report/promotion/overView",
+                    "promo": True,
+                    "body": {
+                        "mallId": 753391861,
+                        "mallName": "港珠汇富专卖店",
+                        "result": {
+                            "list": [
+                                {
+                                    "statDate": "2026-10-25",
+                                    "goodsId": 9001,
+                                    "goodsName": "渔获单品",
+                                    "impression": 80,
+                                    "click": 6,
+                                    "spend": 4.0,
+                                    "gmv": 20,
+                                    "orderNum": 1,
+                                },
+                                {
+                                    "statDate": "2026-10-25",
+                                    "creativeId": "c1",
+                                    "creativeName": "主图A",
+                                    "goodsId": 9001,
+                                    "goodsName": "渔获单品",
+                                    "impression": 80,
+                                    "click": 6,
+                                    "spend": 4.0,
+                                    "gmv": 20,
+                                    "orderNum": 1,
+                                },
+                            ]
+                        },
+                    },
+                },
+            ],
+            today=date(2026, 10, 26),
+        )
+        self.assertEqual([item.name for item in payload.goods], ["渔获单品"])
+        self.assertEqual([item.label for item in payload.images], ["主图A"])
+        message = describe_sync(payload, {"campaigns": 1, "goods": 1, "images": 1, "days": 1})
+        self.assertIn("已同步", message)
+        self.assertIn("测图 1", message)
+        self.assertNotIn("Token不合法", message)
+        self.assertNotIn("首页推广花费", message)

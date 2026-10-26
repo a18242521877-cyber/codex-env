@@ -128,6 +128,12 @@ class Handler(BaseHTTPRequestHandler):
             mode = load_settings(conn).data_mode
             self._json(200, create_login_ticket(conn, mode, now))
             return
+        if method == "POST" and path == "/api/auth/open":
+            from app.services.live_login import open_login_gate
+
+            gate = str((self._body() or {}).get("gate") or "mms")
+            self._json(200, open_login_gate(conn, now, gate))
+            return
         if method == "POST" and path == "/api/auth/logout":
             self._json(200, logout(conn))
             return
@@ -153,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             mode = load_settings(conn).data_mode
             if session["mode"] != mode:
                 raise AppError(
-                    "当前登录和数据模式不一致。请退出后，按现在的模式重新扫码。",
+                    "当前登录和数据模式不一致。请退出后，打开对应登录页自己完成登录，再点「同步」。",
                     status=409,
                     code="mode_mismatch",
                 )

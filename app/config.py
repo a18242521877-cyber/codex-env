@@ -11,6 +11,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 OFFICIAL_LOGIN_URL = "https://mms.pinduoduo.com/login/"
 OFFICIAL_PROMO_URL = "https://yingxiao.pinduoduo.com/mains/promotionOverview"
+# 每个需要登录的页面都只打开固定地址。用户自己登录，再回来点同步。
+LOGIN_GATES = (
+    {"id": "mms", "label": "商家后台", "url": OFFICIAL_LOGIN_URL},
+    {"id": "yingxiao", "label": "推广中心", "url": OFFICIAL_PROMO_URL},
+    {"id": "goods", "label": "商品推广", "url": "https://yingxiao.pinduoduo.com/goods/promotion/list"},
+    {"id": "report", "label": "推广报表", "url": "https://yingxiao.pinduoduo.com/goods/report/promotion/overView"},
+    {"id": "finance", "label": "推广账户", "url": "https://yingxiao.pinduoduo.com/mains/account/finance"},
+)
 QR_TTL_SECONDS = 120
 LIVE_LOGIN_SECONDS = 300
 SESSION_DAYS = 7
@@ -28,7 +36,7 @@ SETTING_FIELDS: list[dict] = [
             {"value": "live", "label": "真实店铺"},
             {"value": "mock", "label": "模拟店铺"},
         ],
-        "help": "真实店铺会在本机弹出浏览器，打开拼多多商家后台扫码。Cookie 只留在这台电脑。模拟店铺不联网，用来演示。",
+        "help": "真实店铺会在本机弹出浏览器，打开固定登录页。请自己完成登录，再点同步。Cookie 只留在这台电脑。模拟店铺不联网，用来演示。",
     },
     {
         "key": "refresh_interval_minutes",

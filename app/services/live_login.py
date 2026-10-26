@@ -16,7 +16,8 @@ from app.adapters.pdd_session import (
     storage_state_is_logged_in,
     storage_state_path,
 )
-from app.config import LIVE_LOGIN_SECONDS, OFFICIAL_LOGIN_URL, SESSION_DAYS
+from app.adapters.pdd_normalize import SAVED_LOGIN_NOTE
+from app.config import LIVE_LOGIN_SECONDS, LOGIN_GATES, OFFICIAL_LOGIN_URL, SESSION_DAYS
 from app.db import connect, database_path, init_db, log_op
 from app.errors import AppError
 from app.timeutil import iso
@@ -30,7 +31,14 @@ _auth_lock = threading.Lock()
 _auth_generation = 0
 _driver = None
 
-READING_MESSAGE = "已扫码，正在读取推广报表。若窗口停在授权页，请点一次「推广中心」，不要关窗口，也不要先点「重新打开登录」。"
+READING_MESSAGE = SAVED_LOGIN_NOTE
+
+
+def gate_by_id(gate: str) -> dict:
+    for item in LOGIN_GATES:
+        if item["id"] == gate:
+            return item
+    raise AppError("没有这个登录页", status=400, code="unknown_gate")
 
 
 class LoginJob:
@@ -145,12 +153,22 @@ def retain_saved_login(db_path: str | Path, job: LoginJob | None = None) -> None
     del db_path, job
 
 
-def start_live_login(conn: sqlite3.Connection, now: datetime) -> dict:
+def open_login_gate(conn: sqlite3.Connection, now: datetime, gate: str) -> dict:
+    """打开固定登录页或目标页。用户自己登录，这里不收报表。"""
+    return start_live_login(conn, now, gate=gate, force_open=True)
+
+
+def start_live_login(conn: sqlite3.Connection, now: datetime, *, gate: str = "mms", force_open: bool = False) -> dict:
+    chosen = gate_by_id(gate)
     db_path = Path(database_path(conn))
+    from app.services.auth import public_session
+
+    session = public_session(conn, now)
+    already = bool(session.get("logged_in") and session.get("mode") == "live")
     existing = _reusable_job(db_path, conn)
-    if existing is not None:
+    if existing is not None and not force_open:
         return _job_payload(existing)
-    if storage_state_is_logged_in(storage_state_path(db_path)):
+    if not force_open and storage_state_is_logged_in(storage_state_path(db_path)):
         return _resume_saved_login(conn, now, db_path)
     driver = current_driver()
     driver.check_ready()
@@ -173,7 +191,7 @@ def start_live_login(conn: sqlite3.Connection, now: datetime) -> dict:
         remember_job(job)
         thread = threading.Thread(
             target=_worker,
-            args=(job, str(db_path)),
+            args=(job, str(db_path), chosen["url"], not already),
             name="pdd-login",
             daemon=True,
         )
@@ -181,8 +199,12 @@ def start_live_login(conn: sqlite3.Connection, now: datetime) -> dict:
     except Exception:
         release_browser()
         raise
-    log_op(conn, "登录", "已打开真实店铺登录窗口")
-    return _job_payload(job, expires=expires)
+    log_op(conn, "登录", f"已打开{chosen['label']}")
+    body = _job_payload(job, expires=expires)
+    body["gate"] = chosen
+    body["message"] = f"已打开{chosen['label']}。请在弹出的浏览器里自己完成登录，回到推广台后再点「同步」。"
+    body["hint"] = body["message"]
+    return body
 
 
 def _reusable_job(db_path: Path, conn: sqlite3.Connection) -> LoginJob | None:
@@ -241,7 +263,7 @@ def _resume_saved_login(conn: sqlite3.Connection, now: datetime, db_path: Path) 
 
 def _job_payload(job: LoginJob, *, expires: datetime | None = None) -> dict:
     snap = job.snapshot()
-    message = snap["message"] or "请用「拼多多商家版」App 扫描弹出窗口里的二维码。"
+    message = snap["message"] or "请在弹出的浏览器里自己完成登录，回到推广台后再点「同步」。"
     body = {
         "ready": True,
         "mode": "live",
@@ -259,9 +281,9 @@ def _job_payload(job: LoginJob, *, expires: datetime | None = None) -> dict:
     return body
 
 
-def _worker(job: LoginJob, db_path: str) -> None:
+def _worker(job: LoginJob, db_path: str, open_url: str | None = None, establish_session: bool = True) -> None:
     try:
-        current_driver().run(job, db_path)
+        current_driver().run(job, db_path, open_url=open_url, establish_session=establish_session)
         snap = job.snapshot()
         if snap["finished"] or snap["status"] == "confirmed":
             return
@@ -324,7 +346,7 @@ def poll_live_job(conn: sqlite3.Connection, ticket: str, row, now: datetime) -> 
         "ticket": ticket,
         "status": status,
         "mode": "live",
-        "message": "登录窗口已关闭。若刚才已经扫过码，点「用已保存登录进入」。",
+        "message": "登录窗口已关闭。若刚才已经登录，点「用已保存登录进入」，再点「同步」。",
         "qr_image": None,
         "resume_available": resume_available,
     }

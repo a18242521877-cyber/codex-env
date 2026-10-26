@@ -81,6 +81,25 @@ EFFECT_HTML = """<!doctype html><html><body>
 <script>fetch("/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms");</script>
 </body></html>"""
 SSO_HTML = """<!doctype html><html><body><p>推广中心授权</p></body></html>"""
+HOME_SPEND_HTML = """<!doctype html><html><body>
+<div class="shop-name">港珠汇富专卖店</div>
+<section>
+  <h2>推广花费</h2>
+  <p>今日 220.15</p>
+  <p>昨日 386.40</p>
+</section>
+</body></html>"""
+SSO_AVATAR_HTML = """<!doctype html><html><body>
+<div class="shop-name">港珠汇富专卖店</div>
+<p>点击头像直接登录</p>
+<div class="avatar" id="avatar">头像</div>
+<script>
+document.getElementById("avatar").onclick = function () {
+  fetch("/janus/api/subSystem/generateAccessToken?redirectUrl=https%3A%2F%2Fyingxiao.pinduoduo.com%2Fmains%2FpromotionOverview");
+};
+</script>
+</body></html>"""
+TOKEN_INVALID_JSON = """{"success":false,"errorCode":2,"errorMsg":"Token不合法"}"""
 SSO_BUTTON_HTML = """<!doctype html><html><body>
 <button type="button" id="enter">推广中心</button>
 <script>
@@ -153,10 +172,21 @@ class Handler(BaseHTTPRequestHandler):
             "/api/generated-report.json": ("application/json", GENERATED_JSON.encode()),
             "/sycm/goods_effect/detail": ("text/html; charset=utf-8", EFFECT_HTML.encode()),
             "/login/sso": ("text/html; charset=utf-8", SSO_HTML.encode()),
+            "/home-spend": ("text/html; charset=utf-8", HOME_SPEND_HTML.encode()),
+            "/home-spend/": ("text/html; charset=utf-8", HOME_SPEND_HTML.encode()),
+            "/janus/api/subSystem/generateAccessToken": ("application/json", TOKEN_INVALID_JSON.encode()),
             "/sydney/api/goodsDataShow/queryGoodsPageOverviewForMms": ("application/json", SYDNEY_JSON.encode()),
             "/goods/report/promotion/overView": ("text/html; charset=utf-8", REPORT_DIM_HTML.encode()),
             "/api/creative/list.json": ("application/json", CREATIVE_JSON.encode()),
         }
+        if path == "/login/sso" and "token=1" in self.path:
+            ctype, body = "text/html; charset=utf-8", SSO_AVATAR_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/login/sso" and "ready=1" in self.path:
             ctype, body = "text/html; charset=utf-8", SSO_BUTTON_HTML.encode()
             self.send_response(200)
@@ -178,6 +208,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def _sync_saved(conn, driver, db_path):
+    """登录只保存会话。报表要再走一次同步。"""
+    from datetime import date
+
+    from app.db import log_op
+    from app.services.sync import describe_sync, persist_payload
+
+    payload = driver.collect(db_path, today=date.today())
+    counts = persist_payload(conn, payload, synced_at=iso(now_local()))
+    message = describe_sync(payload, counts)
+    log_op(conn, "同步", message)
+    conn.execute("UPDATE sessions SET shop_id = ? WHERE id = 1", (payload.shop.shop_id,))
+    conn.commit()
+    return message
 
 
 def _chromium_ready() -> bool:
@@ -222,6 +268,8 @@ class BrowserFixtureTests(unittest.TestCase):
             job = LoginJob("fixture-ticket")
             driver.run(job, db_path)
             self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            self.assertIn("登录已保存", job.snapshot()["message"])
+            _sync_saved(conn, driver, db_path)
             storage = storage_state_path(db_path)
             self.assertTrue(storage.is_file())
             self.assertEqual(storage.stat().st_mode & 0o777, 0o600)
@@ -272,6 +320,7 @@ class BrowserFixtureTests(unittest.TestCase):
             job = LoginJob("promo-ticket")
             driver.run(job, db_path)
             self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            _sync_saved(conn, driver, db_path)
             names = [row["name"] for row in conn.execute("SELECT name FROM goods")]
             self.assertEqual(names, ["渔获单品"])
             spend = conn.execute(
@@ -327,6 +376,7 @@ class BrowserFixtureTests(unittest.TestCase):
             job = LoginJob("sydney-ticket")
             driver.run(job, db_path)
             self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            _sync_saved(conn, driver, db_path)
             row = conn.execute(
                 """
                 SELECT g.stat_date, g.spend_fen, g.gmv_fen, g.orders
@@ -352,7 +402,7 @@ class BrowserFixtureTests(unittest.TestCase):
             httpd.server_close()
             thread.join(timeout=5)
 
-    def test_sso_button_opens_goods_and_creative_report(self):
+    def test_sso_button_is_not_clicked_during_sync(self):
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -380,25 +430,92 @@ class BrowserFixtureTests(unittest.TestCase):
             job = LoginJob("creative-ticket")
             driver.run(job, db_path)
             self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            _sync_saved(conn, driver, db_path)
             names = [row["name"] for row in conn.execute("SELECT name FROM goods ORDER BY name")]
-            self.assertIn("渔获单品", names)
+            self.assertIn("全店商品数据", names)
+            self.assertNotIn("渔获单品", names)
             label = conn.execute("SELECT label FROM image_tests").fetchone()
-            self.assertIsNotNone(label)
-            self.assertEqual(label["label"], "主图A")
             last = conn.execute(
                 "SELECT detail FROM operation_logs WHERE action = '同步' ORDER BY id DESC LIMIT 1"
             ).fetchone()
             self.assertIsNotNone(last)
-            self.assertIn("测图 1", last["detail"])
-            self.assertIn("测款 1", last["detail"])
-            self.assertNotIn("登录态为空", last["detail"])
+            self.assertNotIn("测图 1", last["detail"])
+            self.assertNotIn("测款 1", last["detail"])
+            self.assertIn("自己完成登录", last["detail"])
+            self.assertIn("测图测款未写入", last["detail"])
+            self.assertNotIn("已同步", last["detail"])
+            self.assertIsNone(label)
             from app.adapters.pdd_session import capture_path
 
             raw = capture_path(db_path).read_text(encoding="utf-8")
             saved = json.loads(raw)
             self.assertEqual(saved[0]["kind"], "debug")
-            self.assertTrue(any(item.get("promo") and item.get("path") == "/api/creative/list.json" for item in saved if item.get("kind") == "json"))
-            self.assertTrue(any(item.get("path") == "/api/creative/list.json" and item.get("promo") for item in saved[0]["urls"]))
+            self.assertFalse(any(item.get("path") == "/api/creative/list.json" for item in saved))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_avatar_token_invalid_keeps_home_spend_and_skips_images(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        try:
+            init_db(conn)
+            now = now_local()
+            conn.execute(
+                "INSERT INTO login_tickets(ticket, mode, status, created_at, expires_at) VALUES(?, 'live', 'pending', ?, ?)",
+                ("avatar-ticket", iso(now), iso(now)),
+            )
+            conn.commit()
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            driver = PlaywrightLiveDriver(
+                login_url=base + "/login/",
+                report_urls=[base + "/home-spend/", base + "/login/sso?token=1"],
+                headless=True,
+                sso_probe_seconds=5,
+                sso_wait_seconds=0,
+            )
+            job = LoginJob("avatar-ticket")
+            driver.run(job, db_path)
+            self.assertEqual(job.snapshot()["status"], "confirmed", job.snapshot())
+            _sync_saved(conn, driver, db_path)
+            names = [row["name"] for row in conn.execute("SELECT name FROM goods")]
+            self.assertIn("首页推广花费", names)
+            images = conn.execute("SELECT COUNT(*) AS n FROM image_tests").fetchone()
+            self.assertEqual(images["n"], 0)
+            from datetime import date, timedelta
+
+            today = date.today().isoformat()
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            spends = {
+                row["stat_date"]: row["spend_fen"]
+                for row in conn.execute(
+                    """
+                    SELECT d.stat_date, d.spend_fen
+                    FROM goods_daily d
+                    JOIN goods g ON g.goods_id = d.goods_id
+                    WHERE g.name = '首页推广花费'
+                    """
+                )
+            }
+            self.assertEqual(spends.get(today), 22015)
+            self.assertEqual(spends.get(yesterday), 38640)
+            last = conn.execute(
+                "SELECT detail FROM operation_logs WHERE action = '同步' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(last)
+            self.assertNotIn("Token不合法", last["detail"])
+            self.assertIn("自己完成登录", last["detail"])
+            self.assertIn("测图测款未写入", last["detail"])
+            self.assertNotIn("已同步", last["detail"])
+            self.assertNotIn("测款 1", last["detail"])
+            self.assertNotIn("测图 1", last["detail"])
         finally:
             httpd.shutdown()
             httpd.server_close()
