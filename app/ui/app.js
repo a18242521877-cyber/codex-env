@@ -209,9 +209,10 @@ async function startQr() {
       <h2>用商家版扫码登录</h2>
       <div class="qr-wrap" id="qr-slot"><img id="live-qr" alt="拼多多商家登录二维码" hidden /></div>
       <p class="small" id="login-status">${esc(data.hint || data.message || "")}</p>
-      <p class="small muted">弹出的窗口就是商家后台。请用「拼多多商家版」扫码，验证码也在那个窗口里完成。Cookie 只留在这台电脑。</p>
+      <p class="small muted">只扫弹出的浏览器窗口，不要扫这张截图的照片。出现「正在读取推广报表」时不要点「重新打开登录」。验证码在那个窗口里完成。</p>
       <div class="actions">
         <button class="btn ghost" type="button" data-act="refresh-qr">重新打开登录</button>
+        ${data.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
         <a class="btn" href="${esc(data.official_login_url)}" target="_blank" rel="noreferrer">登录页地址</a>
       </div>`;
     poll(gen, data.ticket);
@@ -248,12 +249,15 @@ async function poll(gen, ticket) {
       return;
     }
     if (status.status === "failed") {
+      if (note) note.textContent = status.message || "登录没有完成";
       toast(status.message || "登录失败");
+      showResume(status);
       return;
     }
     if (status.status === "expired") {
       if (img) {
-        if (note) note.textContent = status.message || "二维码已过期，请重新打开登录";
+        if (note) note.textContent = status.message || "二维码已过期。若已经扫过，点「用已保存登录进入」。";
+        showResume(status);
         return;
       }
       toast("二维码已过期，已刷新");
@@ -265,6 +269,15 @@ async function poll(gen, ticket) {
     return;
   }
   setTimeout(() => poll(gen, ticket), 1500);
+}
+
+function showResume(status) {
+  const actions = document.querySelector("#login-panel .actions");
+  if (!actions || !status.resume_available || document.getElementById("resume-slot")) return;
+  actions.insertAdjacentHTML(
+    "afterbegin",
+    '<button class="btn primary" type="button" data-act="resume-login" id="resume-slot">用已保存登录进入</button>',
+  );
 }
 
 function renderShell() {
@@ -628,7 +641,7 @@ async function onClick(event) {
       state.settings = await api("/api/settings", { method: "PUT", body: { data_mode: node.dataset.mode } });
       renderLogin();
       startQr();
-    } else if (act === "refresh-qr") {
+    } else if (act === "refresh-qr" || act === "resume-login") {
       startQr();
     } else if (act === "confirm") {
       node.disabled = true;

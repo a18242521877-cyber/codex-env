@@ -62,7 +62,7 @@ def create_login_ticket(conn: sqlite3.Connection, mode: str, now: datetime | Non
         return start_live_login(conn, now)
     from app.services.live_login import cancel_jobs
 
-    cancel_jobs()
+    cancel_jobs(force=True)
     ticket = secrets.token_urlsafe(18)
     expires = now + timedelta(seconds=QR_TTL_SECONDS)
     payload = f"pddmon://mock-confirm?ticket={ticket}"
@@ -146,9 +146,9 @@ def confirm_ticket(conn: sqlite3.Connection, ticket: str, now: datetime | None =
 def logout(conn: sqlite3.Connection) -> dict:
     from app.adapters.pdd_session import remove_session_files
     from app.db import database_path
-    from app.services.live_login import cancel_jobs
+    from app.services.live_login import begin_logout
 
-    cancel_jobs()
+    begin_logout()
     remove_session_files(database_path(conn))
     session = public_session(conn)
     with conn:

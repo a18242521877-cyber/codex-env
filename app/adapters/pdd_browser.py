@@ -16,11 +16,19 @@ from datetime import date
 from pathlib import Path
 
 from app.adapters.pdd_normalize import normalize_captures
-from app.adapters.pdd_session import capture_path, storage_state_path, tighten, write_private_text
+from app.adapters.pdd_session import (
+    PASS_COOKIE_NAMES,
+    capture_path,
+    is_shop_token_cookie,
+    page_looks_logged_in,
+    storage_state_path,
+    tighten,
+    write_private_text,
+)
 from app.config import OFFICIAL_LOGIN_URL, OFFICIAL_PROMO_URL
 from app.errors import AppError
 
-LOGIN_COOKIE_NAMES = {"PASS_ID", "SUB_PASS_ID"}
+LOGIN_COOKIE_NAMES = PASS_COOKIE_NAMES
 DEFAULT_REPORT_URLS = (
     OFFICIAL_PROMO_URL,
     "https://yingxiao.pinduoduo.com/",
@@ -98,27 +106,55 @@ class PlaywrightLiveDriver:
                     else:
                         if not self._wait_for_scan(page, job, db_path, wait_seconds):
                             return None
-                        if _cancelled(job):
+                        if _cancelled(job) and not job.snapshot().get("cookies_saved"):
                             return None
                         _save_storage(context, db_path)
+                        from app.services.live_login import READING_MESSAGE, finish_live_session
+
+                        hint = _shop_name(page)
+                        job.update(cookies_saved=True, message=READING_MESSAGE)
+                        provisional = normalize_captures([], shop_hint=hint or "拼多多店铺", today=today)
+                        if not provisional.note:
+                            provisional.note = "已登录。报表还在读取，进入店铺后等十几秒再刷新页面。"
+                        result = finish_live_session(
+                            db_path,
+                            provisional,
+                            job.ticket,
+                            generation=getattr(job, "generation", None),
+                        )
+                        if result.get("skipped"):
+                            return None
+                        job.update(
+                            status="confirmed",
+                            finished=True,
+                            cookies_saved=True,
+                            message=result.get("message") or READING_MESSAGE,
+                        )
                     hint = _shop_name(page)
-                    captures = self._harvest(page, context, db_path)
+                    try:
+                        captures = self._harvest(page, context, db_path, keep_session=job is not None)
+                    except AppError:
+                        if job is not None:
+                            from app.services.live_login import retain_saved_login
+
+                            retain_saved_login(db_path, job)
+                            return None
+                        raise
                     hint = _shop_name(page) or hint
+                    from app.services.live_login import generation_is_current, retain_saved_login, update_live_payload
+
+                    if job is not None and not generation_is_current(getattr(job, "generation", None)):
+                        retain_saved_login(db_path, job)
+                        return None
                     _save_capture(db_path, captures)
                     payload = normalize_captures(captures, shop_hint=hint, today=today)
                     if job is None:
                         return payload
-                    if _cancelled(job):
-                        return None
-                    from app.services.live_login import finish_live_session
 
-                    result = finish_live_session(db_path, payload, job.ticket)
-                    if _cancelled(job):
-                        from app.services.live_login import drop_live_login
-
-                        drop_live_login(db_path)
-                        return None
-                    job.update(status="confirmed", message=result["message"])
+                    updated = update_live_payload(db_path, payload, generation=getattr(job, "generation", None))
+                    if updated and updated.get("message"):
+                        job.update(message=updated["message"])
+                    retain_saved_login(db_path, job)
                     return None
                 finally:
                     browser.close()
@@ -144,17 +180,29 @@ class PlaywrightLiveDriver:
             page.goto(self.login_url, wait_until="domcontentloaded", timeout=20000)
         except Exception as exc:
             raise _browser_error(exc) from exc
+        def _on_frame(frame) -> None:
+            del frame
+
+        try:
+            page.on("framenavigated", _on_frame)
+        except Exception:
+            pass
         deadline = time.time() + wait_seconds
         while time.time() < deadline:
-            if _cancelled(job):
+            if _cancelled(job) and not job.snapshot().get("cookies_saved"):
                 return False
             image = _qr_image(page)
             if image:
-                job.update(qr_image=image, message="请用拼多多商家版 App 扫描窗口或这里的二维码")
+                job.update(qr_image=image, message="请用拼多多商家版 App 扫描弹出窗口里的二维码")
             if _logged_in(page.context, page):
-                job.update(message="已扫码，正在读取推广报表…")
+                from app.services.live_login import READING_MESSAGE
+
+                job.update(message=READING_MESSAGE)
                 return True
-            page.wait_for_timeout(500)
+            try:
+                page.wait_for_url(lambda url: "/login" not in (url or ""), timeout=400)
+            except Exception:
+                page.wait_for_timeout(200)
         from app.services.live_login import mark_ticket
 
         mark_ticket(db_path, job.ticket, "expired")
@@ -168,7 +216,7 @@ class PlaywrightLiveDriver:
         except Exception as exc:
             raise _browser_error(exc) from exc
 
-    def _harvest(self, page, context, db_path: Path) -> list[dict]:
+    def _harvest(self, page, context, db_path: Path, keep_session: bool = False) -> list[dict]:
         bucket: list[dict] = []
 
         def on_response(response) -> None:
@@ -181,6 +229,8 @@ class PlaywrightLiveDriver:
             except Exception:
                 continue
             if "/login" in (page.url or "") and not _has_login_cookie(context):
+                if keep_session:
+                    return bucket
                 from app.services.live_login import drop_live_login
 
                 drop_live_login(db_path)
@@ -213,18 +263,22 @@ def _cancelled(job) -> bool:
     return bool(job.snapshot().get("cancelled"))
 
 
-def _has_login_cookie(context) -> bool:
+def _cookie_names(context) -> set[str]:
     try:
-        names = {item.get("name", "") for item in context.cookies()}
+        return {str(item.get("name") or "") for item in context.cookies()}
     except Exception:
-        return False
-    return bool(names & LOGIN_COOKIE_NAMES)
+        return set()
+
+
+def _has_login_cookie(context) -> bool:
+    names = _cookie_names(context)
+    if names & LOGIN_COOKIE_NAMES:
+        return True
+    return any(is_shop_token_cookie(name) for name in names)
 
 
 def _logged_in(context, page) -> bool:
-    if not _has_login_cookie(context):
-        return False
-    return "/login" not in (page.url or "")
+    return page_looks_logged_in(_cookie_names(context), page.url or "")
 
 
 def _save_storage(context, db_path: Path) -> None:

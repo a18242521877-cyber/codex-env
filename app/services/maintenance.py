@@ -28,9 +28,9 @@ def reset_local_data(conn: sqlite3.Connection, confirm: str) -> dict:
         raise AppError("请输入「清空」以确认。设置项会保留。")
     from app.adapters.pdd_session import remove_session_files
     from app.db import database_path
-    from app.services.live_login import cancel_jobs
+    from app.services.live_login import begin_logout
 
-    cancel_jobs()
+    begin_logout()
     remove_session_files(database_path(conn))
     with conn:
         for table in _TABLES:
