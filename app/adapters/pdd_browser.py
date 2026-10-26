@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
+import threading
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
@@ -215,6 +217,13 @@ def promo_surface_url(url: str) -> bool:
     return any(marker in path for marker in ("/goods/report/", "/goods/promotion/", "/mains/promotion", "/mains/account/"))
 
 
+def should_open_report_url(url: str, cookies: list[dict] | None) -> bool:
+    """没有推广中心登录时，不要自己打开营销域名，否则会停在 SSO。"""
+    if yingxiao_host(url) and not yingxiao_session_ready(cookies):
+        return False
+    return True
+
+
 def yingxiao_session_ready(cookies: list[dict] | None) -> bool:
     """营销域名上的 _nano_fp 只是指纹，不是推广中心登录态。"""
     for item in cookies or []:
@@ -303,6 +312,9 @@ class PlaywrightLiveDriver:
         self.channel = channel
         self.sso_probe_seconds = sso_probe_seconds
         self.sso_wait_seconds = sso_wait_seconds
+        self._hold_commands: queue.Queue | None = None
+        self._hold_thread: threading.Thread | None = None
+        self._hold_guard = threading.Lock()
 
     def check_ready(self) -> None:
         try:
@@ -331,6 +343,180 @@ class PlaywrightLiveDriver:
 
     def collect(self, db_path, *, today: date):
         return self._browse(db_path, job=None, today=today, wait_seconds=0, restore=True, harvest=True)
+
+    def has_open_session(self) -> bool:
+        thread = self._hold_thread
+        return thread is not None and thread.is_alive()
+
+    def open_url_only(self, db_path, url: str) -> str:
+        """弹出 Edge 并打开固定地址。不等扫码，不代点头像，窗口留着给店主登录。"""
+        self.check_ready()
+        self._ensure_hold(Path(db_path))
+        opened = self._hold_call(("goto", str(url)), timeout=45)
+        return str(opened or url)
+
+    def harvest_open(self, db_path, today: date):
+        """在已经打开的 Edge 窗口里收报表。窗口关了就返回 None，改读已保存的登录。"""
+        if not self.has_open_session():
+            return None
+        try:
+            payload = self._hold_call(("harvest", str(db_path), today.isoformat()), timeout=180)
+        except AppError as exc:
+            if exc.code != "browser_closed":
+                raise
+            payload = None
+        if payload is None:
+            thread = self._hold_thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=8)
+        return payload
+
+    def close_open_session(self) -> None:
+        if not self.has_open_session():
+            return
+        try:
+            self._hold_call(("close",), timeout=20)
+        except Exception:
+            pass
+        thread = self._hold_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+    def _ensure_hold(self, db_path: Path) -> None:
+        with self._hold_guard:
+            if self.has_open_session():
+                return
+            commands: queue.Queue = queue.Queue()
+            ready = threading.Event()
+            holder: dict = {}
+            thread = threading.Thread(
+                target=self._hold_loop,
+                args=(db_path, commands, ready, holder),
+                name="pdd-edge-hold",
+                daemon=True,
+            )
+            self._hold_commands = commands
+            self._hold_thread = thread
+            thread.start()
+        if not ready.wait(timeout=40):
+            raise AppError("浏览器没有打开", status=504, code="browser_timeout")
+        error = holder.get("error")
+        if isinstance(error, AppError):
+            raise error
+        if error:
+            raise _browser_error(error if isinstance(error, Exception) else Exception(str(error)))
+
+    def _hold_call(self, command: tuple, timeout: float):
+        commands = self._hold_commands
+        if commands is None or not self.has_open_session():
+            raise AppError("浏览器已关闭", status=409, code="browser_closed")
+        box: queue.Queue = queue.Queue(maxsize=1)
+        commands.put((command, box))
+        try:
+            ok, value = box.get(timeout=timeout)
+        except queue.Empty:
+            raise AppError("浏览器没有响应", status=504, code="browser_timeout")
+        if not ok:
+            if isinstance(value, AppError):
+                raise value
+            if isinstance(value, Exception):
+                raise _browser_error(value)
+            raise AppError("浏览器操作失败，请重试。", status=502, code="browser_failed")
+        return value
+
+    def _hold_loop(self, db_path: Path, commands: queue.Queue, ready: threading.Event, holder: dict) -> None:
+        from playwright.sync_api import sync_playwright
+
+        from app.services.live_login import acquire_browser, release_browser
+
+        if not acquire_browser(8):
+            holder["error"] = AppError("浏览器正忙，请稍后再试", status=409, code="browser_busy")
+            ready.set()
+            return
+        browser = None
+        try:
+            with sync_playwright() as playwright:
+                browser = self._launch(playwright)
+                options = {
+                    "locale": "zh-CN",
+                    "accept_downloads": True,
+                    "viewport": {"width": 1280, "height": 860},
+                }
+                state = storage_state_path(db_path)
+                if state.is_file():
+                    options["storage_state"] = str(state)
+                context = browser.new_context(**options)
+                page = context.new_page()
+                ready.set()
+                while True:
+                    try:
+                        command, box = commands.get(timeout=1)
+                    except queue.Empty:
+                        if _has_yingxiao_session(context) or _has_login_cookie(context):
+                            try:
+                                _save_storage(context, db_path)
+                            except Exception:
+                                pass
+                        if not _context_has_page(context):
+                            break
+                        continue
+                    kind = command[0]
+                    try:
+                        if kind == "close":
+                            box.put((True, None))
+                            break
+                        if kind == "goto":
+                            page = _latest_page(context, page)
+                            if _page_closed(page):
+                                page = context.new_page()
+                            page.goto(command[1], wait_until="domcontentloaded", timeout=20000)
+                            if _has_yingxiao_session(context) or _has_login_cookie(context):
+                                _save_storage(context, db_path)
+                            box.put((True, _page_url(page)))
+                            continue
+                        if kind == "harvest":
+                            harvest_db = Path(command[1])
+                            today = date.fromisoformat(command[2])
+                            if not _context_has_page(context):
+                                box.put((True, None))
+                                break
+                            page = _latest_page(context, page)
+                            captures, seen = self._harvest(page, context, harvest_db, keep_session=False, job=None)
+                            if _has_yingxiao_session(context) or _has_login_cookie(context):
+                                _save_storage(context, harvest_db)
+                            _save_capture(harvest_db, captures, seen)
+                            hint = _shop_name(_latest_page(context, page))
+                            payload = normalize_captures(captures, shop_hint=hint or "拼多多店铺", today=today)
+                            box.put((True, payload))
+                            continue
+                        box.put((False, AppError("未知浏览器指令", status=500, code="browser_failed")))
+                    except Exception as exc:
+                        box.put((False, exc if isinstance(exc, AppError) else _browser_error(exc)))
+        except Exception as exc:
+            holder["error"] = exc if isinstance(exc, AppError) else _browser_error(exc)
+            if not ready.is_set():
+                ready.set()
+        finally:
+            self._drain_hold(commands)
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            release_browser()
+            if self._hold_thread is threading.current_thread():
+                self._hold_thread = None
+
+    def _drain_hold(self, commands: queue.Queue) -> None:
+        while True:
+            try:
+                _command, box = commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box.put((False, AppError("浏览器已关闭", status=409, code="browser_closed")))
+            except Exception:
+                return
 
     def _browse(
         self,
@@ -500,6 +686,10 @@ class PlaywrightLiveDriver:
 
         context.on("response", on_response)
         for url in self.report_urls:
+            if not should_open_report_url(url, _cookie_records(context)):
+                stuck = True
+                stuck_gate = stuck_gate or "推广中心"
+                continue
             if stuck and (is_sso_entry(url) or yingxiao_host(url)):
                 continue
             active = _latest_page(context, page)
@@ -759,6 +949,20 @@ def _cookie_records(context) -> list[dict]:
 
 def _has_yingxiao_session(context) -> bool:
     return yingxiao_session_ready(_cookie_records(context))
+
+
+def _context_has_page(context) -> bool:
+    try:
+        return any(not item.is_closed() for item in context.pages)
+    except Exception:
+        return False
+
+
+def _page_closed(page) -> bool:
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return True
 
 
 def _capture_home_spend(page, bucket: list[dict]) -> None:

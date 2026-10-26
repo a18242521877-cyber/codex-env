@@ -141,9 +141,9 @@ def _narrative(name, day, complete, current, previous, top, weak, best_image, wo
     )
     parts = [opening, body]
     if shop_data_only and current["spend_yuan"] > 0:
-        parts.append("推广花费来自商家后台首页汇总，不是测款或测图。请打开推广中心页面，自己完成登录后再点「同步」。")
+        parts.append("推广花费来自商家后台首页汇总，不是测款或测图。请先在浏览器登录推广中心，再到本应用点同步。")
     elif shop_data_only:
-        parts.append("成交额和订单来自商家后台「商品数据」，不是推广测款，也没有测图。请打开推广中心页面，自己完成登录后再点「同步」。")
+        parts.append("成交额和订单来自商家后台「商品数据」，不是推广测款，也没有测图。请先在浏览器登录推广中心，再到本应用点同步。")
     if top:
         best = top[0]
         parts.append(

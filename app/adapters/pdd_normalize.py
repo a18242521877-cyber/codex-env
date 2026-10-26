@@ -52,8 +52,18 @@ _SCENE = ("scene", "推广场景", "推广类型", "场景", "计划类型")
 _STAGE = ("stage", "阶段")
 _MALL_ID = ("mallId", "mall_id", "shopId")
 _MALL_NAME = ("mallName", "mall_name", "shopName", "店铺名称", "店铺名")
+OFFICIAL_YINGXIAO_URL = "https://yingxiao.pinduoduo.com/mains/promotionOverview"
+YINGXIAO_SYNC_HINT = (
+    "请先在浏览器登录推广中心，再到本应用点同步。"
+    f"地址：{OFFICIAL_YINGXIAO_URL} 。"
+    "请用 Edge 打开该页，自己完成登录（头像或二维码都可以），并停留在推广概况或商品报表，不要关窗口。"
+)
+
+
 def manual_login_tail(gate: str) -> str:
-    """商家后台、推广中心和其他登录页都用同一句下一步。"""
+    """推广中心未登录时，都指向同一个固定页面，不代点、不等扫码。"""
+    if "推广" in (gate or ""):
+        return YINGXIAO_SYNC_HINT
     return (
         f"请打开{gate}，在浏览器里自己完成登录，回到推广台后再点「同步」。"
         "同步只读取已保存的登录，不会代点，也不会等待扫码。"
@@ -268,7 +278,15 @@ def note_says_auth_failed(note: str) -> bool:
     text = note or ""
     return any(
         mark in text
-        for mark in ("测图测款未写入", "登录态为空", "没有写入推广花费", "未授权", "授权没有完成", "Token不合法")
+        for mark in (
+            "测图测款未写入",
+            "登录态为空",
+            "没有写入推广花费",
+            "未授权",
+            "授权没有完成",
+            "Token不合法",
+            "请先在浏览器登录推广中心",
+        )
     )
 
 

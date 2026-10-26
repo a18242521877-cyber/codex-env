@@ -36,7 +36,7 @@ SETTING_FIELDS: list[dict] = [
             {"value": "live", "label": "真实店铺"},
             {"value": "mock", "label": "模拟店铺"},
         ],
-        "help": "真实店铺会在本机弹出浏览器，打开固定登录页。请自己完成登录，再点同步。Cookie 只留在这台电脑。模拟店铺不联网，用来演示。",
+        "help": "真实店铺请先在 Edge 打开推广中心并自己完成登录，停留在推广概况或商品报表，再点同步。程序不代点、不等待扫码。Cookie 只留在这台电脑。模拟店铺不联网，用来演示。",
     },
     {
         "key": "refresh_interval_minutes",

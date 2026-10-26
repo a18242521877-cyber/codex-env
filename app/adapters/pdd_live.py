@@ -11,11 +11,11 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.adapters.base import SyncPayload
-from app.adapters.pdd_normalize import MMS_LOGIN_NOTE
+from app.adapters.pdd_normalize import YINGXIAO_SYNC_HINT
 from app.adapters.pdd_session import storage_state_path
 from app.errors import AppError
 
-_SCAN = MMS_LOGIN_NOTE
+_SCAN = "推广中心尚未登录，测图测款未写入。" + YINGXIAO_SYNC_HINT
 
 
 class PddLiveAdapter:
@@ -26,12 +26,16 @@ class PddLiveAdapter:
 
     def fetch(self, *, today: date, now: datetime) -> SyncPayload:
         del now
-        if not storage_state_path(self.db_path).is_file():
-            raise AppError(_SCAN, status=409, code="login_required")
         from app.services.live_login import acquire_browser, current_driver, release_browser
 
         driver = current_driver()
         driver.check_ready()
+        if driver.has_open_session():
+            payload = driver.harvest_open(self.db_path, today=today)
+            if payload is not None:
+                return payload
+        if not storage_state_path(self.db_path).is_file():
+            raise AppError(_SCAN, status=409, code="login_required")
         if not acquire_browser(0):
             raise AppError("浏览器正忙，请稍后再试", status=409, code="browser_busy")
         try:

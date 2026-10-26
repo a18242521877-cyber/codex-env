@@ -121,7 +121,11 @@ function stopPoll() {
   pollGen += 1;
 }
 
+const YINGXIAO_URL = "https://yingxiao.pinduoduo.com/mains/promotionOverview";
+const YINGXIAO_HINT = `请先在浏览器登录推广中心，再到本应用点同步。地址：${YINGXIAO_URL} 。请用 Edge 打开该页，自己完成登录（头像或二维码都可以），并停留在推广概况或商品报表，不要关窗口。`;
+
 function manualLogin(gate) {
+  if ((gate || "").includes("推广")) return YINGXIAO_HINT;
   return `请打开${gate}，在浏览器里自己完成登录，回到推广台后再点「同步」。同步只读取已保存的登录，不会代点，也不会等待扫码。`;
 }
 
@@ -131,13 +135,6 @@ function loginGates() {
     { id: "mms", label: "商家后台", url: "https://mms.pinduoduo.com/login/" },
     { id: "yingxiao", label: "推广中心", url: "https://yingxiao.pinduoduo.com/mains/promotionOverview" },
   ];
-}
-
-function gateButtons(withLinks) {
-  return loginGates().map((gate) => `
-    <button class="btn" type="button" data-act="open-gate" data-gate="${esc(gate.id)}">打开${esc(gate.label)}</button>
-    ${withLinks ? `<a class="btn ghost" href="${esc(gate.url)}" target="_blank" rel="noreferrer">${esc(gate.label)}地址</a>` : ""}
-  `).join("");
 }
 
 async function boot() {
@@ -179,7 +176,7 @@ function renderLogin() {
           <div><strong>推广台</strong><span>拼多多店铺</span></div>
         </div>
         <h1>看清推广、测图和测款，当天就能决定怎么调。</h1>
-        <p class="lead">打开登录页并自己完成后，点「同步」查看花费、成交和 ROI，再生成每日总结与调整方案。数据留在这台电脑上。</p>
+        <p class="lead">先用 Edge 打开推广中心并自己完成登录，停留在推广概况或商品报表，再点「同步」。程序不代点、不等待扫码。数据留在这台电脑上。</p>
         <div class="points">
           <div><strong>测图</strong><span class="muted"> 比较主图点击率和转化率，样本够了再建议换图。</span></div>
           <div><strong>测款</strong><span class="muted"> 按近 7 个完整日判断放量、暂停，或先改详情。</span></div>
@@ -243,16 +240,30 @@ async function startQr() {
   poll(gen, data.ticket);
 }
 
+function yingxiaoGate() {
+  return loginGates().find((gate) => gate.id === "yingxiao") || {
+    id: "yingxiao",
+    label: "推广中心",
+    url: YINGXIAO_URL,
+  };
+}
+
 function liveGateMarkup(switcher, message) {
+  const gate = yingxiaoGate();
+  const others = loginGates().filter((item) => item.id !== gate.id);
+  const links = others.map((item) => `<a href="${esc(item.url)}" target="_blank" rel="noreferrer">${esc(item.label)}</a>`).join(" · ");
   return `
     ${switcher}
-    <h2>自己完成登录</h2>
-    <p class="small" id="login-status">${esc(message || "先打开要登录的页面。在弹出的浏览器里自己完成登录，回到这里再点「同步」。")}</p>
-    <p class="small muted">${esc(manualLogin("商家后台、推广中心或其他登录页"))} 头像若返回「Token不合法」，那是登录失败，不是成功。营销域名上只有 _nano_fp 也不算登录。</p>
+    <h2>先在 Edge 登录推广中心</h2>
+    <p class="small" id="login-status">${esc(message || YINGXIAO_HINT)}</p>
+    <p class="small muted">请用本应用弹出的 Edge 窗口登录（头像或二维码都可以），并停留在推广概况或商品报表。不要关窗口，再点「同步」。程序不会代点头像，也不会等待扫码。头像若返回「Token不合法」，那是登录失败。营销域名上只有 _nano_fp 也不算登录。</p>
     <div class="actions">
-      ${gateButtons(true)}
-      ${state.session && state.session.resume_available ? '<button class="btn primary" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
-    </div>`;
+      <button class="btn primary" type="button" data-act="open-gate" data-gate="${esc(gate.id)}">打开推广中心</button>
+      <button class="btn primary" type="button" data-act="sync-ready">同步</button>
+      ${state.session && state.session.resume_available ? '<button class="btn" type="button" data-act="resume-login">用已保存登录进入</button>' : ""}
+    </div>
+    <p class="small muted">固定地址：<a href="${esc(gate.url)}" target="_blank" rel="noreferrer">${esc(gate.url)}</a></p>
+    <p class="small muted">其他页面只给地址，不会自动登录：${links}</p>`;
 }
 
 function renderLiveGates() {
@@ -341,7 +352,7 @@ function renderShell() {
             <input id="stat-date" type="date" value="${esc(state.date)}" ${min} ${max} />
             <button class="btn" type="button" data-act="yesterday">昨天</button>
             <button class="btn" type="button" data-act="sync" ${state.syncing ? "disabled" : ""}>同步</button>
-            ${state.session.mode === "live" ? gateButtons(false) : ""}
+            ${state.session.mode === "live" ? '<button class="btn" type="button" data-act="open-gate" data-gate="yingxiao">打开推广中心</button>' : ""}
             <button class="btn ghost" type="button" data-act="logout">退出</button>
           </div>
         </header>
@@ -648,6 +659,7 @@ function renderSettings(payload) {
         <li>ROI = 成交额 / 花费。点击率 = 点击 / 曝光。转化率 = 订单 / 点击。</li>
         <li>模拟成交额 = 订单 × 标价。真实店铺用报表里的交易额。表格按元；接口里的整数按分、小数按元。若和后台差 100 倍，以后台为准。</li>
         <li>调整方案看最近 7 个完整日。查看今天时，测款和测图仍截止到昨天；只有预算节奏用今天的花费。</li>
+        <li>测款和测图只来自推广中心报表。请先在 Edge 登录推广中心并停留在推广概况或商品报表，再点同步。商品数据页的成交额不是测款。未登录时不会显示测款成功。</li>
       </ul>
       <h2>本地数据</h2>
       <p class="small">退出登录不会删历史。下面的操作会删掉店铺、报表、日报和建议，设置保留。</p>
@@ -697,12 +709,17 @@ async function onClick(event) {
     } else if (act === "refresh-qr" || act === "resume-login") {
       startQr();
     } else if (act === "open-gate") {
-      const opened = await api("/api/auth/open", { method: "POST", body: { gate: node.dataset.gate } });
-      state.ticket = opened.ticket;
+      const opened = await api("/api/auth/open", { method: "POST", body: { gate: node.dataset.gate || "yingxiao" } });
+      state.ticket = opened.ticket || "";
       const status = document.getElementById("login-status");
       if (status) status.textContent = opened.message || opened.hint || "";
-      else toast(opened.message || "已打开登录页");
+      toast(opened.message || "已打开推广中心");
       if (opened.ticket) poll(++pollGen, opened.ticket);
+    } else if (act === "sync-ready") {
+      node.disabled = true;
+      const result = await api("/api/auth/sync-ready", { method: "POST", body: {} });
+      if (result.message) toast(result.message);
+      await boot();
     } else if (act === "confirm") {
       node.disabled = true;
       await api(`/api/auth/qr/${encodeURIComponent(state.ticket)}/confirm`, { method: "POST", body: {} });
@@ -761,6 +778,7 @@ async function onClick(event) {
     }
   } catch (error) {
     state.syncing = false;
+    if (node) node.disabled = false;
     toast(error.message);
     if (error.status === 401) await boot();
   }

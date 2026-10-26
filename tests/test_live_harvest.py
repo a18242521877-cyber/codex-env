@@ -23,6 +23,7 @@ from app.adapters.pdd_browser import (
     capture_has_sydney,
     default_report_urls,
     guidance_note,
+    should_open_report_url,
     is_date_preset_label,
     is_dimension_label,
     is_promo_nav_label,
@@ -566,3 +567,48 @@ class HarvestSelectionTests(unittest.TestCase):
         self.assertIn("测图 1", message)
         self.assertNotIn("Token不合法", message)
         self.assertNotIn("首页推广花费", message)
+
+
+class OpenYingxiaoTests(unittest.TestCase):
+    def test_sync_skips_yingxiao_until_a_real_session_cookie_exists(self):
+        overview = "https://yingxiao.pinduoduo.com/mains/promotionOverview"
+        self.assertFalse(should_open_report_url(overview, []))
+        self.assertFalse(
+            should_open_report_url(
+                overview,
+                [{"name": "_nano_fp", "domain": ".yingxiao.pinduoduo.com"}],
+            )
+        )
+        self.assertTrue(
+            should_open_report_url(
+                overview,
+                [{"name": "SUB_PASS_ID", "domain": ".yingxiao.pinduoduo.com"}],
+            )
+        )
+        self.assertTrue(should_open_report_url("https://mms.pinduoduo.com/home/", []))
+        self.assertTrue(should_open_report_url("http://127.0.0.1:9/login/sso", []))
+
+    def test_open_gate_only_records_the_promo_url(self):
+        from app.adapters.scripted_driver import ScriptedLiveDriver
+        from app.db import connect, init_db
+        from app.services.live_login import open_login_gate, sync_when_ready, use_driver
+        from app.timeutil import now_local
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        conn = connect(Path(tmp.name) / "open.sqlite")
+        self.addCleanup(conn.close)
+        init_db(conn)
+        driver = ScriptedLiveDriver()
+        use_driver(driver)
+        self.addCleanup(lambda: use_driver(None))
+        opened = open_login_gate(conn, now_local(), "yingxiao")
+        self.assertNotIn("ticket", opened)
+        self.assertIn("请先在浏览器登录推广中心，再到本应用点同步", opened["message"])
+        self.assertIn("https://yingxiao.pinduoduo.com/mains/promotionOverview", opened["message"])
+        self.assertEqual(driver.opened_url, "https://yingxiao.pinduoduo.com/mains/promotionOverview")
+        self.assertFalse(driver.has_open_session())
+        with self.assertRaises(Exception) as caught:
+            sync_when_ready(conn, now_local())
+        self.assertIn("请先在浏览器登录推广中心，再到本应用点同步", str(caught.exception))
+        self.assertNotIn("测款 0", str(caught.exception))

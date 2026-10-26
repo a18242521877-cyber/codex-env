@@ -103,8 +103,10 @@ class RuleTests(unittest.TestCase):
         adapter = PddLiveAdapter(Path(self.tmp.name) / "rules.sqlite")
         with self.assertRaises(AppError) as caught:
             adapter.fetch(today=self.now.date(), now=self.now)
-        self.assertIn("同步", str(caught.exception))
-        self.assertIn("商家后台", str(caught.exception))
+        text = str(caught.exception)
+        self.assertIn("请先在浏览器登录推广中心，再到本应用点同步", text)
+        self.assertIn("https://yingxiao.pinduoduo.com/mains/promotionOverview", text)
+        self.assertNotIn("测款 0", text)
 
     def test_pace_classifier(self):
         settings = load_settings(self.conn)

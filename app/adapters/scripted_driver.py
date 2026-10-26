@@ -52,7 +52,25 @@ def scripted_payload(today: date | None = None):
 
 
 class ScriptedLiveDriver:
+    def __init__(self):
+        self.opened_url = ""
+
     def check_ready(self) -> None:
+        return None
+
+    def open_url_only(self, db_path, url: str) -> str:
+        del db_path
+        self.opened_url = url
+        return url
+
+    def has_open_session(self) -> bool:
+        return False
+
+    def harvest_open(self, db_path, today):
+        del db_path, today
+        return None
+
+    def close_open_session(self) -> None:
         return None
 
     def run(self, job, db_path, **kwargs) -> None:

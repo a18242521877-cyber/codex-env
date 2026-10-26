@@ -131,8 +131,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/auth/open":
             from app.services.live_login import open_login_gate
 
-            gate = str((self._body() or {}).get("gate") or "mms")
+            gate = str((self._body() or {}).get("gate") or "yingxiao")
             self._json(200, open_login_gate(conn, now, gate))
+            return
+        if method == "POST" and path == "/api/auth/sync-ready":
+            from app.services.live_login import sync_when_ready
+
+            self._json(200, sync_when_ready(conn, now))
             return
         if method == "POST" and path == "/api/auth/logout":
             self._json(200, logout(conn))

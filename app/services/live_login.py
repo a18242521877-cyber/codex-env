@@ -87,11 +87,13 @@ def use_driver(driver) -> None:
 
 
 def current_driver():
+    global _driver
     if _driver is not None:
         return _driver
     from app.adapters.pdd_browser import PlaywrightLiveDriver
 
-    return PlaywrightLiveDriver()
+    _driver = PlaywrightLiveDriver()
+    return _driver
 
 
 def current_generation() -> int:
@@ -111,6 +113,12 @@ def begin_logout() -> None:
     with _auth_lock:
         _auth_generation += 1
     cancel_jobs(force=True)
+    driver = _driver
+    if driver is not None:
+        try:
+            driver.close_open_session()
+        except Exception:
+            logger.exception("close open browser")
 
 
 def cancel_jobs(*, force: bool = False) -> None:
@@ -154,8 +162,60 @@ def retain_saved_login(db_path: str | Path, job: LoginJob | None = None) -> None
 
 
 def open_login_gate(conn: sqlite3.Connection, now: datetime, gate: str) -> dict:
-    """打开固定登录页或目标页。用户自己登录，这里不收报表。"""
-    return start_live_login(conn, now, gate=gate, force_open=True)
+    """只打开固定地址。不截二维码，不等待登录，不代点头像。"""
+    del now
+    chosen = gate_by_id(gate)
+    db_path = Path(database_path(conn))
+    driver = current_driver()
+    driver.check_ready()
+    driver.open_url_only(db_path, chosen["url"])
+    from app.adapters.pdd_normalize import YINGXIAO_SYNC_HINT
+
+    if "推广" in chosen["label"]:
+        message = f"已打开{chosen['label']}。{YINGXIAO_SYNC_HINT}"
+    else:
+        message = (
+            f"已打开{chosen['label']}。请在弹出的 Edge 窗口里自己完成登录，停留在该页，再回到推广台点「同步」。"
+            "程序不会代点，也不会等待扫码。"
+        )
+    log_op(conn, "登录", f"已打开{chosen['label']}")
+    return {
+        "ready": True,
+        "opened": True,
+        "mode": "live",
+        "url": chosen["url"],
+        "message": message,
+        "hint": message,
+        "gate": chosen,
+    }
+
+
+def sync_when_ready(conn: sqlite3.Connection, now: datetime) -> dict:
+    """用户说已经登录后才收报表。没有打开的窗口、也没有已保存登录时，不启动浏览器。"""
+    from app.services.auth import public_session
+    from app.settings import load_settings
+
+    if load_settings(conn).data_mode != "live":
+        raise AppError("当前是模拟店铺。请用模拟确认进入，或先切换到真实店铺。", status=409, code="mode_mismatch")
+    session = public_session(conn, now)
+    if session.get("logged_in") and session.get("mode") == "live":
+        from app.services.sync import sync_account
+
+        return sync_account(conn, mode="live", now=now)
+    if session.get("logged_in"):
+        raise AppError(
+            "当前登录和数据模式不一致。请退出后，打开推广中心自己完成登录，再点「同步」。",
+            status=409,
+            code="mode_mismatch",
+        )
+    from app.adapters.pdd_live import PddLiveAdapter
+    from app.db import database_path
+
+    payload = PddLiveAdapter(database_path(conn)).fetch(today=now.date(), now=now)
+    result = finish_live_session(database_path(conn), payload, "", generation=current_generation())
+    if result.get("skipped"):
+        raise AppError(result.get("message") or "同步已取消", status=409, code="login_cancelled")
+    return {"ok": True, **result}
 
 
 def start_live_login(conn: sqlite3.Connection, now: datetime, *, gate: str = "mms", force_open: bool = False) -> dict:

@@ -54,7 +54,9 @@ def public_session(conn: sqlite3.Connection, now: datetime | None = None) -> dic
 def require_session(conn: sqlite3.Connection, now: datetime | None = None) -> dict:
     session = public_session(conn, now)
     if not session["logged_in"]:
-        raise AuthError("商家后台尚未登录。请打开商家后台登录页，在浏览器里自己完成登录，回到推广台后再点「同步」。")
+        from app.adapters.pdd_normalize import YINGXIAO_SYNC_HINT
+
+        raise AuthError("推广中心尚未登录，测图测款未写入。" + YINGXIAO_SYNC_HINT)
     return session
 
 
