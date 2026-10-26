@@ -172,7 +172,10 @@ def open_login_gate(conn: sqlite3.Connection, now: datetime, gate: str) -> dict:
     from app.adapters.pdd_normalize import YINGXIAO_SYNC_HINT
 
     if "推广" in chosen["label"]:
-        message = f"已打开{chosen['label']}。{YINGXIAO_SYNC_HINT}"
+        message = (
+            f"已打开{chosen['label']}。这是干净的登录窗口，不会带上商家后台的旧登录，授权页不会反复刷新。"
+            + YINGXIAO_SYNC_HINT
+        )
     else:
         message = (
             f"已打开{chosen['label']}。请在弹出的 Edge 窗口里自己完成登录，停留在该页，再回到推广台点「同步」。"

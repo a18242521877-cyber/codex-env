@@ -23,7 +23,9 @@ from app.adapters.pdd_browser import (
     capture_has_sydney,
     default_report_urls,
     guidance_note,
+    cookies_for_manual_open,
     should_open_report_url,
+    should_persist_manual_session,
     is_date_preset_label,
     is_dimension_label,
     is_promo_nav_label,
@@ -587,6 +589,32 @@ class OpenYingxiaoTests(unittest.TestCase):
         )
         self.assertTrue(should_open_report_url("https://mms.pinduoduo.com/home/", []))
         self.assertTrue(should_open_report_url("http://127.0.0.1:9/login/sso", []))
+        kept = cookies_for_manual_open(
+            overview,
+            [
+                {"name": "PASS_ID", "value": "stale", "domain": ".pinduoduo.com"},
+                {"name": "SUB_PASS_ID", "value": "promo", "domain": ".yingxiao.pinduoduo.com"},
+                {"name": "_nano_fp", "value": "fp", "domain": ".yingxiao.pinduoduo.com"},
+            ],
+        )
+        self.assertEqual([item["name"] for item in kept], ["SUB_PASS_ID", "_nano_fp"])
+        self.assertEqual(
+            cookies_for_manual_open(
+                overview,
+                [{"name": "PASS_ID", "value": "stale", "domain": ".pinduoduo.com"}],
+            ),
+            [],
+        )
+        self.assertEqual(cookies_for_manual_open("https://mms.pinduoduo.com/login/", kept), [])
+        session = [{"name": "SUB_PASS_ID", "domain": ".yingxiao.pinduoduo.com"}]
+        self.assertTrue(should_persist_manual_session(overview, session))
+        self.assertFalse(
+            should_persist_manual_session(
+                "https://mms.pinduoduo.com/login/sso?platform=yingxiao",
+                [{"name": "PASS_ID", "domain": ".pinduoduo.com"}],
+            )
+        )
+        self.assertFalse(should_persist_manual_session(overview, [{"name": "PASS_ID", "domain": ".pinduoduo.com"}]))
 
     def test_open_gate_only_records_the_promo_url(self):
         from app.adapters.scripted_driver import ScriptedLiveDriver

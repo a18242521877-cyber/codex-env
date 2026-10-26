@@ -224,6 +224,42 @@ def should_open_report_url(url: str, cookies: list[dict] | None) -> bool:
     return True
 
 
+def cookie_breaks_yingxiao_sso(item: dict) -> bool:
+    """商家后台的 PASS_ID 会让推广中心 SSO 自动换票。失败后页面反复刷新，二维码也停不住。"""
+    if not isinstance(item, dict):
+        return False
+    domain = str(item.get("domain") or "").lower()
+    if "yingxiao" in domain:
+        return False
+    name = str(item.get("name") or "")
+    folded = name.upper()
+    if name in {"PASS_ID", "SUB_PASS_ID"} or "PASS" in folded or is_shop_token_cookie(name):
+        return True
+    return False
+
+
+def cookies_for_manual_open(url: str, cookies: list[dict] | None) -> list[dict]:
+    """手动打开登录页时用的 Cookie。没有推广中心会话就什么都不带。"""
+    items = [item for item in (cookies or []) if isinstance(item, dict)]
+    if not yingxiao_host(url):
+        return []
+    kept = [item for item in items if not cookie_breaks_yingxiao_sso(item)]
+    if not yingxiao_session_ready(kept):
+        return []
+    return kept
+
+
+def should_persist_manual_session(url: str, cookies: list[dict] | None) -> bool:
+    """只有已经离开授权页、进入推广中心页面，才把登录写入磁盘。"""
+    if not url or on_sso_page(url) or _auth_gate_label(url):
+        return False
+    if "/login" in (urlsplit(url).path or ""):
+        return False
+    if not yingxiao_host(url) or not promo_surface_url(url):
+        return False
+    return yingxiao_session_ready(cookies)
+
+
 def yingxiao_session_ready(cookies: list[dict] | None) -> bool:
     """营销域名上的 _nano_fp 只是指纹，不是推广中心登录态。"""
     for item in cookies or []:
@@ -442,9 +478,8 @@ class PlaywrightLiveDriver:
                     "accept_downloads": True,
                     "viewport": {"width": 1280, "height": 860},
                 }
-                state = storage_state_path(db_path)
-                if state.is_file():
-                    options["storage_state"] = str(state)
+                # 不把已保存的商家后台 PASS_ID 灌进这个窗口。推广中心 SSO 会拿它换票，
+                # Token不合法 之后整页刷新，二维码停不住。
                 context = browser.new_context(**options)
                 page = context.new_page()
                 ready.set()
@@ -452,11 +487,10 @@ class PlaywrightLiveDriver:
                     try:
                         command, box = commands.get(timeout=1)
                     except queue.Empty:
-                        if _has_yingxiao_session(context) or _has_login_cookie(context):
-                            try:
-                                _save_storage(context, db_path)
-                            except Exception:
-                                pass
+                        try:
+                            _maybe_save_landed(context, db_path, _latest_page(context, page))
+                        except Exception:
+                            pass
                         if not _context_has_page(context):
                             break
                         continue
@@ -469,9 +503,9 @@ class PlaywrightLiveDriver:
                             page = _latest_page(context, page)
                             if _page_closed(page):
                                 page = context.new_page()
+                            _prepare_manual_context(context, command[1], db_path)
                             page.goto(command[1], wait_until="domcontentloaded", timeout=20000)
-                            if _has_yingxiao_session(context) or _has_login_cookie(context):
-                                _save_storage(context, db_path)
+                            _maybe_save_landed(context, db_path, page)
                             box.put((True, _page_url(page)))
                             continue
                         if kind == "harvest":
@@ -481,9 +515,11 @@ class PlaywrightLiveDriver:
                                 box.put((True, None))
                                 break
                             page = _latest_page(context, page)
+                            if not yingxiao_session_ready(_cookie_records(context)):
+                                box.put((False, AppError(AUTH_FAILED_NOTE, status=409, code="login_required")))
+                                continue
                             captures, seen = self._harvest(page, context, harvest_db, keep_session=False, job=None)
-                            if _has_yingxiao_session(context) or _has_login_cookie(context):
-                                _save_storage(context, harvest_db)
+                            _maybe_save_landed(context, harvest_db, _latest_page(context, page))
                             _save_capture(harvest_db, captures, seen)
                             hint = _shop_name(_latest_page(context, page))
                             payload = normalize_captures(captures, shop_hint=hint or "拼多多店铺", today=today)
@@ -548,7 +584,7 @@ class PlaywrightLiveDriver:
                     page = context.new_page()
                     if restore:
                         self._open_first(page)
-                        if not _has_login_cookie(context):
+                        if not _has_login_cookie(context) and not _has_yingxiao_session(context):
                             from app.services.live_login import drop_live_login
 
                             drop_live_login(db_path)
@@ -702,6 +738,8 @@ class PlaywrightLiveDriver:
             _capture_home_spend(active, bucket)
             gate = _auth_gate_label(_page_url(active))
             if gate == "商家后台" and not _has_login_cookie(context):
+                if _has_yingxiao_session(context):
+                    continue
                 if keep_session:
                     return bucket, seen
                 from app.services.live_login import drop_live_login
@@ -780,6 +818,70 @@ def _save_storage(context, db_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     context.storage_state(path=str(path))
     tighten(path)
+
+
+def load_saved_cookies(db_path: Path) -> list[dict]:
+    path = storage_state_path(db_path)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    cookies = data.get("cookies")
+    if not isinstance(cookies, list):
+        return []
+    return [item for item in cookies if isinstance(item, dict)]
+
+
+def _playwright_cookie(item: dict) -> dict | None:
+    name = str(item.get("name") or "")
+    domain = str(item.get("domain") or "")
+    if not name or item.get("value") is None or not domain:
+        return None
+    cookie = {
+        "name": name,
+        "value": str(item.get("value")),
+        "domain": domain,
+        "path": str(item.get("path") or "/"),
+    }
+    expires = item.get("expires")
+    if isinstance(expires, (int, float)) and expires > 0:
+        cookie["expires"] = float(expires)
+    if "httpOnly" in item:
+        cookie["httpOnly"] = bool(item["httpOnly"])
+    if "secure" in item:
+        cookie["secure"] = bool(item["secure"])
+    same = item.get("sameSite")
+    if same in {"Strict", "Lax", "None"}:
+        cookie["sameSite"] = same
+    return cookie
+
+
+def _prepare_manual_context(context, url: str, db_path: Path) -> None:
+    """打开登录页前清掉窗口里的 Cookie，只放回已经能用的推广中心会话。"""
+    try:
+        context.clear_cookies()
+    except Exception:
+        pass
+    batch = []
+    for item in cookies_for_manual_open(url, load_saved_cookies(db_path)):
+        cookie = _playwright_cookie(item)
+        if cookie is not None:
+            batch.append(cookie)
+    if not batch:
+        return
+    try:
+        context.add_cookies(batch)
+    except Exception:
+        return
+
+
+def _maybe_save_landed(context, db_path: Path, page) -> None:
+    if should_persist_manual_session(_page_url(page), _cookie_records(context)):
+        _save_storage(context, db_path)
 
 
 def _json_chars(body) -> int:

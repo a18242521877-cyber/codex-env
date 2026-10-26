@@ -256,7 +256,7 @@ function liveGateMarkup(switcher, message) {
     ${switcher}
     <h2>先在 Edge 登录推广中心</h2>
     <p class="small" id="login-status">${esc(message || YINGXIAO_HINT)}</p>
-    <p class="small muted">请用本应用弹出的 Edge 窗口登录（头像或二维码都可以），并停留在推广概况或商品报表。不要关窗口，再点「同步」。程序不会代点头像，也不会等待扫码。头像若返回「Token不合法」，那是登录失败。营销域名上只有 _nano_fp 也不算登录。</p>
+    <p class="small muted">「打开推广中心」使用干净窗口，不会带上商家后台的旧登录，避免授权页因 Token不合法反复刷新。请在这个窗口里登录（头像或二维码都可以），并停留在推广概况或商品报表。不要关窗口，再点「同步」。程序不会代点头像，也不会等待扫码。营销域名上只有 _nano_fp 也不算登录。</p>
     <div class="actions">
       <button class="btn primary" type="button" data-act="open-gate" data-gate="${esc(gate.id)}">打开推广中心</button>
       <button class="btn primary" type="button" data-act="sync-ready">同步</button>

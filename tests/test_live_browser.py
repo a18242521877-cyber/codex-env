@@ -5,13 +5,16 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 import unittest
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
 
 from app.adapters.pdd_browser import PlaywrightLiveDriver
-from app.adapters.pdd_session import storage_state_path
+from app.adapters.pdd_session import storage_state_path, write_private_text
+from app.errors import AppError
 from app.db import connect, init_db
 from app.services.live_login import LoginJob
 from app.timeutil import iso, now_local
@@ -100,6 +103,17 @@ document.getElementById("avatar").onclick = function () {
 </script>
 </body></html>"""
 TOKEN_INVALID_JSON = """{"success":false,"errorCode":2,"errorMsg":"Token不合法"}"""
+SSO_LOOP_HTML = """<!doctype html><html><head><title>stable-qr</title></head><body>
+<p id="qr">qr</p>
+<script>
+if (document.cookie.indexOf("PASS_ID=") >= 0) {
+  fetch("/janus/api/subSystem/generateAccessToken");
+  setTimeout(function () { location.replace("/sso-loop?loop=1"); }, 40);
+} else {
+  document.getElementById("qr").textContent = "stable-qr";
+}
+</script>
+</body></html>"""
 SSO_BUTTON_HTML = """<!doctype html><html><body>
 <button type="button" id="enter">推广中心</button>
 <script>
@@ -148,11 +162,25 @@ CSV = "日期,商品名称,商品ID,推广计划,曝光,点击,花费,成交笔�
 
 
 class Handler(BaseHTTPRequestHandler):
+    sso_loop_hits = 0
+    token_hits = 0
+
     def log_message(self, fmt: str, *args) -> None:
         return
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/janus/api/subSystem/generateAccessToken":
+            Handler.token_hits += 1
+        if path == "/sso-loop":
+            Handler.sso_loop_hits += 1
+            body = SSO_LOOP_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         routes = {
             "/login": ("text/html; charset=utf-8", LOGIN_HTML.encode()),
             "/login/": ("text/html; charset=utf-8", LOGIN_HTML.encode()),
@@ -516,6 +544,102 @@ class BrowserFixtureTests(unittest.TestCase):
             self.assertNotIn("已同步", last["detail"])
             self.assertNotIn("测款 1", last["detail"])
             self.assertNotIn("测图 1", last["detail"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_open_gate_does_not_replay_mms_pass_into_sso_loop(self):
+        Handler.sso_loop_hits = 0
+        Handler.token_hits = 0
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        driver = PlaywrightLiveDriver(headless=True, report_urls=["http://127.0.0.1/unused"])
+        try:
+            write_private_text(
+                storage_state_path(db_path),
+                json.dumps(
+                    {
+                        "cookies": [
+                            {
+                                "name": "PASS_ID",
+                                "value": "stale-mms",
+                                "domain": "127.0.0.1",
+                                "path": "/",
+                                "expires": -1,
+                                "httpOnly": False,
+                                "secure": False,
+                                "sameSite": "Lax",
+                            }
+                        ],
+                        "origins": [],
+                    }
+                ),
+            )
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            opened = driver.open_url_only(db_path, base + "/sso-loop")
+            time.sleep(1.0)
+            self.assertNotIn("loop=1", opened)
+            self.assertEqual(Handler.sso_loop_hits, 1)
+            self.assertEqual(Handler.token_hits, 0)
+            saved = storage_state_path(db_path).read_text(encoding="utf-8")
+            self.assertIn("stale-mms", saved)
+            with self.assertRaises(AppError) as caught:
+                driver.harvest_open(db_path, today=date.today())
+            self.assertIn("请先在浏览器登录推广中心，再到本应用点同步", str(caught.exception))
+            self.assertNotIn("测款 0", str(caught.exception))
+            self.assertEqual(Handler.sso_loop_hits, 1)
+        finally:
+            driver.close_open_session()
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_yingxiao_cookie_lets_sync_harvest_creative_report(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "browser.sqlite"
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        try:
+            init_db(conn)
+            write_private_text(
+                storage_state_path(db_path),
+                json.dumps(
+                    {
+                        "cookies": [
+                            {
+                                "name": "SUB_PASS_ID",
+                                "value": "yingxiao-session",
+                                "domain": ".yingxiao.pinduoduo.com",
+                                "path": "/",
+                                "expires": 2000000000,
+                                "httpOnly": True,
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }
+                        ],
+                        "origins": [],
+                    }
+                ),
+            )
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            driver = PlaywrightLiveDriver(
+                headless=True,
+                report_urls=[base + "/goods/report/promotion/overView"],
+            )
+            payload = driver.collect(db_path, today=date.today())
+            self.assertEqual([item.label for item in payload.images], ["主图A"])
+            self.assertIn("渔获单品", [item.name for item in payload.goods])
+            self.assertTrue(storage_state_path(db_path).is_file())
+            self.assertIn("yingxiao-session", storage_state_path(db_path).read_text(encoding="utf-8"))
         finally:
             httpd.shutdown()
             httpd.server_close()
