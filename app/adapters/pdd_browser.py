@@ -74,7 +74,10 @@ def split_response_url(url: str) -> tuple[str, str]:
 
 def is_promo_response_url(url: str) -> bool:
     base, path = split_response_url(url)
-    hay = (base + path).lower()
+    host = urlsplit(base).netloc.lower()
+    if host == "yingxiao.pinduoduo.com" or host.endswith(".yingxiao.pinduoduo.com"):
+        return True
+    hay = (host + path).lower()
     return any(hint in hay for hint in PROMO_URL_HINTS)
 
 

@@ -63,6 +63,7 @@ class HarvestSelectionTests(unittest.TestCase):
         self.assertEqual(path, "/api/goods/promotion/list.json")
         self.assertNotIn("should-not-store", base)
         self.assertTrue(is_promo_response_url(base))
+        self.assertTrue(is_promo_response_url("https://yingxiao.pinduoduo.com/mms-gateway/venus/api/homepage/query"))
         self.assertFalse(is_promo_response_url("https://mms.pinduoduo.com/janus/api/userinfo"))
 
     def test_mikasa_null_is_not_a_report(self):
